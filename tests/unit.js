@@ -657,6 +657,20 @@ function run(argv) {
     ok(reads <= 3, 'read ' + reads + ' windows');
   });
 
+  test('review 4: script rules are protected; attachments are found beyond the first window', function () {
+    Mail.rules.push(item({ name: 'Script', enabled: true, allConditionsMustBeMet: true, ruleConditions: coll([]), shouldMoveMessage: false, markRead: false, deleteMessage: false, stopEvaluatingRules: false, runScript: 'x.scpt' }));
+    has(callErr('write', { action: 'delete_rule', args: { name: 'Script' } }), 'run a script');
+    var box = Mail.box('iCloud', 'INBOX');
+    for (var i = 0; i < 250; i++) box.add({ subject: 'plain ' + i, date: new Date(Date.now() - (i % 50) * 3600e3) });
+    for (var j = 0; j < 100; j++) box.add({ subject: 'older ' + j, date: new Date(Date.now() - 30 * 864e5) });
+    box.add({ subject: 'with file', date: new Date(Date.now() - 10 * 864e5), attachments: ['a.pdf'] });
+    var r = call('read', { action: 'search_messages', args: { account: 'iCloud', has_attachments: true, limit: 1 } });
+    eq(r.items.map(function (x) { return x.subject; }), ['with file']);
+    for (var k = 0; k < 100; k++) box.add({ subject: 'more ' + k, date: new Date(Date.now() - 3600e3) });
+    LAST_READ = { key: null, at: 0 };
+    has(call('read', { action: 'search_messages', args: { account: 'iCloud', has_attachments: true, limit: 1 } }).notes.join(' '), 'Stopped after checking 300');
+  });
+
   // ---- registry sanity
   test('every action has a handler, a tool and arg specs with known types', function () {
     var types = ['string', 'integer', 'boolean', 'id', 'ids', 'list', 'addresses', 'date', 'object', 'objects'];

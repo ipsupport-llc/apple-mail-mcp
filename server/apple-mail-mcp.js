@@ -442,15 +442,20 @@ function newestFirst(a, b) { return (b.date || 0) - (a.date || 0); }
 // The newest messages matching conds, without bulk-reading a whole large mailbox: small folders are read at once,
 // big ones through date windows that widen only until there are enough messages.
 var WINDOW_DAYS = [3, 14, 60, 365, null];
-function newestRows(box, conds, limit, withRecipients) {
+// keep(rows) → rows that count (default: all); windows widen until enough rows count.
+function newestRows(box, conds, limit, withRecipients, keep) {
   function spec(extra) { var c = conds.concat(extra || []); return c.length ? box.ref.messages.whose(c.length > 1 ? { _and: c } : c[0]) : box.ref.messages; }
+  keep = keep || function (rows) { return rows; };
   var hasDate = conds.some(function (c) { return c.dateReceived; });
   var size = safe(function () { return Number(box.ref.messages.length); }, 0);
-  if (hasDate || size <= 300) return rowsOf(spec(), box, withRecipients).sort(newestFirst);
+  if (hasDate || size <= 300) return keep(rowsOf(spec(), box, withRecipients).sort(newestFirst));
   for (var i = 0; i < WINDOW_DAYS.length; i++) {
     var d = WINDOW_DAYS[i], s = spec(d ? [{ dateReceived: { _greaterThan: daysAgo(d) } }] : []);
     var n = safe(function () { return s.id().length; }, 0);
-    if (n >= limit || d === null) return rowsOf(s, box, withRecipients).sort(newestFirst);
+    if (n >= limit || d === null) {
+      var rows = keep(rowsOf(s, box, withRecipients).sort(newestFirst));
+      if (rows.length >= limit || d === null) return rows;
+    }
     checkCancelled();
   }
   return [];
@@ -563,13 +568,14 @@ function extraActions(v) {
   if (v.reply) out.push('reply');
   if (v.copy) out.push('copy to a folder');
   if (v.sound) out.push('play a sound');
+  if (v.script) out.push('run a script');
   if (v.highlight || (v.color && v.color !== 'none')) out.push('colour');
   return out;
 }
 function ruleExtras(r) {
   function get(f) { return safe(function () { return r[f](); }, null); }
   return extraActions({ forward: get('forwardMessage'), redirect: get('redirectMessage'), reply: get('replyText'), copy: get('shouldCopyMessage'),
-    sound: get('playSound'), highlight: get('highlightTextUsingColor'), color: get('colorMessage') });
+    sound: get('playSound'), script: get('runScript'), highlight: get('highlightTextUsingColor'), color: get('colorMessage') });
 }
 function ruleConditionsOf(r) { // three Apple Events per rule, not three per condition
   var c = r.ruleConditions, field = safe(function () { return c.ruleType(); }, []), op = safe(function () { return c.qualifier(); }, []), value = safe(function () { return c.expression(); }, []);
@@ -632,22 +638,24 @@ var MAIL = {
     if (a.flagged) conds.push({ flaggedStatus: true });
     if (!conds.length && !a.has_attachments) fail('Nothing to search for.', 'Give query, or a filter: from, subject, from_date, to_date, unread, flagged, has_attachments.');
     var boxes = a.all_mailboxes ? allBoxes(a.account).filter(function (b) { return NOT_MAIL.indexOf(b.role) < 0; }) : inboxesOf(getMailbox(a.account, a.mailbox));
+    // With has_attachments the windows widen until enough messages *with attachments* are found (one check per message, capped).
+    var checked = 0, MAX_CHECKS = 300, capped = false, seen = {};
+    function withAttachments(rows) {
+      return rows.filter(function (r) {
+        var k = r.messageId || r.id + '|' + boxLabel(r.box);
+        if (k in seen) return seen[k];
+        if (checked >= MAX_CHECKS) { capped = true; return false; }
+        checked++;
+        return (seen[k] = !!safe(function () { return r.spec[r.i].mailAttachments().length; }, 0));
+      });
+    }
     var rows = [];
-    var want = a.has_attachments ? Math.max(a.limit * 5, 100) : a.limit; // attachments are checked afterwards, so look a bit further
     boxes.forEach(function (b) {
       checkCancelled();
-      rows = rows.concat(newestRows(b, conds, want));
+      rows = rows.concat(newestRows(b, conds, a.limit, false, a.has_attachments ? withAttachments : null));
     });
-    rows = dedupe(rows).sort(newestFirst);
-    var out = [], checked = 0, MAX_CHECKS = 300;
-    for (var k = 0; k < rows.length && out.length < a.limit; k++) {
-      if (a.has_attachments) {
-        if (++checked > MAX_CHECKS) { note('Stopped after checking ' + MAX_CHECKS + ' messages for attachments; narrow the search (dates, from, mailbox).'); break; }
-        var r = rows[k];
-        if (!safe(function () { return r.spec[r.i].mailAttachments().length; }, 0)) continue;
-      }
-      out.push(rowOut(rows[k]));
-    }
+    if (capped) note('Stopped after checking ' + MAX_CHECKS + ' messages for attachments; narrow the search (dates, from, mailbox) for more.');
+    var out = dedupe(rows).sort(newestFirst).slice(0, a.limit).map(rowOut);
     if (!out.length && !a.all_mailboxes) note('Searched only ' + boxes.map(boxLabel).join(', ') + '. all_mailboxes:true searches every folder.');
     return out;
   },
@@ -740,13 +748,13 @@ var MAIL = {
     function bulk(f) { return safe(function () { return R[f](); }, []); }
     var enabled = bulk('enabled'), all = bulk('allConditionsMustBeMet'), move = bulk('shouldMoveMessage'), read = bulk('markRead'), flag = bulk('markFlagged'),
       del = bulk('deleteMessage'), stop = bulk('stopEvaluatingRules'), fwd = bulk('forwardMessage'), redir = bulk('redirectMessage'), reply = bulk('replyText'),
-      copy = bulk('shouldCopyMessage'), sound = bulk('playSound'), hl = bulk('highlightTextUsingColor'), color = bulk('colorMessage');
+      copy = bulk('shouldCopyMessage'), sound = bulk('playSound'), script = bulk('runScript'), hl = bulk('highlightTextUsingColor'), color = bulk('colorMessage');
     return names.map(function (n, i) {
       var r = R[i];
       var mv = move[i] ? safe(function () { var mb = r.moveMessage(); return mb.account().name() + ' / ' + mb.name(); }, null) : null;
       var o = { name: n, enabled: enabled[i], match: all[i] ? 'all' : 'any',
         conditions: ruleConditionsOf(r), move_to: mv, mark_read: read[i], flag: flag[i], 'delete': del[i], stop: stop[i] };
-      var other = extraActions({ forward: fwd[i], redirect: redir[i], reply: reply[i], copy: copy[i], sound: sound[i], highlight: hl[i], color: color[i] });
+      var other = extraActions({ forward: fwd[i], redirect: redir[i], reply: reply[i], copy: copy[i], sound: sound[i], script: script[i], highlight: hl[i], color: color[i] });
       if (other.length) o.other_actions = other;
       return o;
     });
@@ -799,7 +807,11 @@ var MAIL = {
       '\nDate: ' + (iso(m.dateReceived()) || '') + '\nSubject: ' + m.subject() + '\n\n' + (safe(function () { return m.content(); }, '') || '');
     var plan = { to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: /^(fwd?|fw):/i.test(m.subject()) ? m.subject() : 'Fwd: ' + m.subject(),
       body: (a.body ? a.body + '\n\n' : '') + original, attachments: files.map(function (x) { return x.name; }) };
-    if (a.dry_run) { plan.body = page(plan.body, 0, 20000).text; return { dry_run: true, would_send: plan }; }
+    if (a.dry_run) {
+      plan.body = page(plan.body, 0, 20000).text;
+      note("Mail writes the forwarded part itself (its own header and formatting), so that part of the body is close to, not exactly, what is sent. Recipients, subject, note and attachments are exact.");
+      return { dry_run: true, would_send: plan };
+    }
     var f = M.forward(m, { openingWindow: a.draft });
     addRecipients(f, 'toRecipients', M.ToRecipient, a.to);
     addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
@@ -1611,12 +1623,12 @@ function toolCall(id, tool, input) {
   }
   (r.notes || []).forEach(note);
   var ms = Date.now() - t0;
-  if (r.timeout) {
+  if (r.timeout || r.died) { // the outcome is unknown: a write may have happened
     remember(call, true);
-    log('← ' + id + ' ' + call.name + ' TIMEOUT after ' + ms + 'ms');
-    return text('Error: ' + app + ' did not answer within ' + CALL_TIMEOUT_S + ' s, so the call was stopped.\nHow to fix: ' + app +
-      ' may be busy, showing a dialog, or waiting for an Automation permission prompt — check it on the Mac.' +
-      (call.spec.tool === 'write' ? ' The change may or may not have happened: check before trying again.' : ' Then try again, perhaps with a smaller limit or a narrower search.'), true);
+    log('← ' + id + ' ' + call.name + (r.timeout ? ' TIMEOUT' : ' WORKER DIED') + ' after ' + ms + 'ms');
+    return text('Error: ' + (r.timeout ? app + ' did not answer within ' + CALL_TIMEOUT_S + ' s, so the call was stopped.' : 'The process talking to ' + app + ' ended before it answered.') +
+      '\nHow to fix: ' + app + ' may be busy, showing a dialog, or waiting for an Automation permission prompt — check it on the Mac.' +
+      (call.spec.tool === 'write' ? ' The change may or may not have happened: check (e.g. the Sent folder) before trying again.' : ' Then try again, perhaps with a smaller limit or a narrower search.'), true);
   }
   log('← ' + id + ' ' + call.name + ' ' + ms + 'ms ' + (r.error ? 'error' + (r.error.number ? ' ' + r.error.number : '') : 'ok'));
   if (r.error) {
@@ -1688,7 +1700,7 @@ var Worker = {
       pump(0.05);
       serveWhileBusy();
       if (CURRENT && CANCELLED[CURRENT.key]) { this.stop(); throw new Cancelled(); }
-      if (this.dead) { this.stop(); return { error: { message: 'The worker process ended unexpectedly.', number: 0 } }; }
+      if (this.dead) { this.stop(); return { died: true }; }
       if (Date.now() > deadline) { this.stop(); return { timeout: true }; }
     }
     return this.replies.shift();
@@ -1709,11 +1721,14 @@ function runAction(name, rawArgs) {
   }
 }
 function workerLoop() { // one JSON request per line on stdin, one reply per line on stdout
-  var stdin = $.NSFileHandle.fileHandleWithStandardInput, buf = '';
+  var stdin = $.NSFileHandle.fileHandleWithStandardInput, bytes = $.NSMutableData.alloc.init, buf = '';
   while (true) {
     var chunk = stdin.availableData;
     if (!chunk || Number(chunk.length) === 0) break;
-    buf += ObjC.unwrap($.NSString.alloc.initWithDataEncoding(chunk, $.NSUTF8StringEncoding)) || '';
+    bytes.appendData(chunk);
+    var str = $.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding);
+    if (!str || str.isNil()) continue; // a character split between chunks: wait for the rest
+    buf += str.js; bytes = $.NSMutableData.alloc.init;
     var nl;
     while ((nl = buf.indexOf('\n')) >= 0) {
       var line = buf.slice(0, nl); buf = buf.slice(nl + 1);

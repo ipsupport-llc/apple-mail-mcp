@@ -184,6 +184,16 @@ check("stderr logs each call with app and time", "→ 20 read.__sleep [Test]" in
 
 # Apple Event errors are explained (fake -1743 through the in-process path is covered in unit tests)
 
+
+# the worker joins a UTF-8 character split between two reads
+w = subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                     env=dict(os.environ, APPLE_MAIL_WORKER="1", APPLE_MAIL_TEST="1"))
+req = json.dumps({"action": "__sleep", "args": {"seconds": 0, "ключ": 1}}, ensure_ascii=False).encode() + b"\n"
+cut = req.index("ключ".encode()) + 1  # in the middle of "к"
+w.stdin.write(req[:cut]); w.stdin.flush(); time.sleep(0.5); w.stdin.write(req[cut:]); w.stdin.close()
+reply = json.loads(w.stdout.readline() or b"{}"); w.wait(timeout=20)
+check("worker handles a character split between reads", "ключ" in json.dumps(reply.get("notes", []), ensure_ascii=False), str(reply))
+
 # install.sh / uninstall.sh against a throwaway HOME
 import shutil
 import tempfile
