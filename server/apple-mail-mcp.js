@@ -29,16 +29,21 @@ function noteFolder(account, folder) {
   return f;
 }
 function getNote(id) { var n = notes().notes.byId(String(id)); n.name(); return n; }
-function noteSummary(spec, limit) {
+var DELETED_FOLDERS = /^(Recently Deleted|Недавно удал[её]нные)$/i;
+function noteSummary(spec, limit, includeDeleted) {
   var ids = spec.id();
   if (!ids.length) return [];
   var names = spec.name(), mod = spec.modificationDate();
   var idx = ids.map(function (_, i) { return i; });
   idx.sort(function (x, y) { return (mod[y] || 0) - (mod[x] || 0); });
-  return idx.slice(0, limit).map(function (i) {
-    var folder = null; try { folder = spec[i].container().name(); } catch (e) {}
-    return { id: ids[i], title: names[i], folder: folder, modified: iso(mod[i]) };
-  });
+  var out = [];
+  for (var k = 0; k < idx.length && out.length < limit; k++) {
+    var i = idx[k], folder = null;
+    try { folder = spec[i].container().name(); } catch (e) {}
+    if (!includeDeleted && folder && DELETED_FOLDERS.test(folder)) continue;
+    out.push({ id: ids[i], title: names[i], folder: folder, modified: iso(mod[i]) });
+  }
+  return out;
 }
 
 // ---------- IO ----------
@@ -48,6 +53,15 @@ function send(obj) {
   stdout.writeData($(s).dataUsingEncoding($.NSUTF8StringEncoding));
 }
 function log(s) { console.log('[apple-mail-mcp] ' + s); } // stderr
+
+// ---------- config (from Claude Desktop extension settings → env) ----------
+function env(k) {
+  try { var v = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey(k)); return (v && String(v).indexOf('${') !== 0) ? String(v) : ''; }
+  catch (e) { return ''; }
+}
+var READ_ONLY = /^(1|true|yes)$/i.test(env('APPLE_MAIL_READ_ONLY'));
+var DEFAULT_ACCOUNT = env('APPLE_MAIL_DEFAULT_ACCOUNT');
+var SAVE_DIR = env('APPLE_MAIL_SAVE_DIR') || (ObjC.unwrap($.NSHomeDirectory()) + '/Downloads');
 
 // ---------- helpers ----------
 function iso(d) { try { return d ? new Date(d).toISOString() : null; } catch (e) { return null; } }
@@ -60,6 +74,7 @@ function getAccount(name) {
 }
 function getMailbox(account, mailbox) {
   if (!account && (!mailbox || /^inbox$/i.test(mailbox))) return mail().inbox;
+  account = account || DEFAULT_ACCOUNT;
   if (!account) throw new Error('Укажите account для ящика "' + mailbox + '"');
   var mb = getAccount(account).mailboxes.byName(mailbox || 'INBOX');
   mb.name();
@@ -100,6 +115,69 @@ function addRecipients(msg, field, ctor, list) {
   });
 }
 
+function addrOf(s) { var m = /<([^>]+)>/.exec(s || ''); return (m ? m[1] : String(s || '')).trim().toLowerCase(); }
+function normSubject(s) {
+  return String(s || '').replace(/^\s*((re|fw|fwd|aw|wg|sv|ответ|отв|пересл|ha)\s*(\[\d+\])?\s*:\s*)+/i, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function myAddresses() {
+  var out = {};
+  mail().accounts().forEach(function (a) { try { a.emailAddresses().forEach(function (e) { out[String(e).toLowerCase()] = true; }); } catch (e) {} });
+  return out;
+}
+var SKIP_BOXES = /^(sent|sent items|sent messages|отправленные|trash|deleted items|deleted messages|корзина|junk|junk mail|junk e-mail|spam|спам|drafts|черновики|outbox|исходящие)$/i;
+var SENT_BOXES = /^(sent|sent items|sent messages|отправленные)$/i;
+// every mailbox of every (or one) account, flattened
+function allMailboxes(account) {
+  var out = [];
+  function walk(list) { list.forEach(function (mb) { out.push(mb); try { var k = mb.mailboxes(); if (k.length) walk(k); } catch (e) {} }); }
+  var accs = account ? [getAccount(account)] : mail().accounts();
+  accs.forEach(function (acc) { try { walk(acc.mailboxes()); } catch (e) {} });
+  return out;
+}
+// raw rows (with a lazy ref) from a message specifier; filters applied later
+function rowsOf(spec) {
+  var ids; try { ids = spec.id(); } catch (e) { return []; }
+  if (!ids.length) return [];
+  function bulk(f) { try { return spec[f](); } catch (e) { return []; } }
+  var dates = bulk('dateReceived'), subs = bulk('subject'), senders = bulk('sender'), read = bulk('readStatus');
+  var replied = bulk('wasRepliedTo'), forwarded = bulk('wasForwarded'), flagged = bulk('flaggedStatus');
+  return ids.map(function (id, i) {
+    return { i: i, spec: spec, id: id, date: dates[i], subject: subs[i], from: senders[i], read: read[i],
+      replied: !!replied[i], forwarded: !!forwarded[i], flagged: !!flagged[i] };
+  });
+}
+function rowOut(r) {
+  var acc = null, mbx = null;
+  try { var mb = r.spec[r.i].mailbox(); mbx = mb.name(); acc = mb.account().name(); } catch (e) {}
+  return { id: r.id, account: acc, mailbox: mbx, date: iso(r.date), from: r.from, subject: r.subject, read: r.read,
+    replied: r.replied, forwarded: r.forwarded, flagged: r.flagged };
+}
+function newestFirst(a, b) { return (b.date || 0) - (a.date || 0); }
+function attachmentsOf(m) {
+  try {
+    return m.mailAttachments().map(function (x) {
+      var o = { name: x.name() };
+      try { o.size = x.fileSize(); } catch (e) {}
+      try { o.mime = x.mimeType(); } catch (e) {}
+      try { o.downloaded = x.downloaded(); } catch (e) {}
+      return o;
+    });
+  } catch (e) { return []; }
+}
+function idsSummary(mb, ids) {
+  return (ids || []).map(function (id) {
+    try { var m = mb.messages.byId(Number(id)); return { id: Number(id), date: iso(m.dateReceived()), from: m.sender(), subject: m.subject() }; }
+    catch (e) { return { id: Number(id), error: 'not found' }; }
+  });
+}
+function fileExists(p) { return $.NSFileManager.defaultManager.fileExistsAtPath(p); }
+function uniquePath(dir, name) {
+  var clean = String(name || 'attachment').replace(/[\/:]/g, '_'), p = dir + '/' + clean, n = 1;
+  var dot = clean.lastIndexOf('.'), base = dot > 0 ? clean.slice(0, dot) : clean, ext = dot > 0 ? clean.slice(dot) : '';
+  while (fileExists(p)) { p = dir + '/' + base + ' (' + (n++) + ')' + ext; }
+  return p;
+}
+
 // ---------- tools ----------
 var TOOLS = [
   { name: 'list_accounts', description: 'Список почтовых аккаунтов Apple Mail и их адресов.',
@@ -110,10 +188,26 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: {
       account: { type: 'string' }, mailbox: { type: 'string', description: 'по умолчанию INBOX' },
       limit: { type: 'number', description: 'по умолчанию 20' }, unread_only: { type: 'boolean' } } } },
-  { name: 'search_messages', description: 'Поиск писем по теме и отправителю (подстрока). Без account/mailbox — во всех «Входящих».',
+  { name: 'search_messages', description: 'Search mail. Text in subject+sender by default (in: body|any for message text — slower). Filters: dates, unread, flagged, has_attachments. all_mailboxes searches every folder (except Trash/Junk) instead of just the Inbox.',
     inputSchema: { type: 'object', properties: {
-      query: { type: 'string' }, account: { type: 'string' }, mailbox: { type: 'string' },
-      limit: { type: 'number', description: 'по умолчанию 20' } }, required: ['query'] } },
+      query: { type: 'string', description: 'optional when other filters are set' },
+      in: { type: 'string', enum: ['subject_sender', 'subject', 'sender', 'body', 'any'], description: 'default subject_sender' },
+      account: { type: 'string' }, mailbox: { type: 'string' }, all_mailboxes: { type: 'boolean' },
+      from_date: { type: 'string', description: 'ISO date' }, to_date: { type: 'string', description: 'ISO date' },
+      unread: { type: 'boolean' }, flagged: { type: 'boolean' }, has_attachments: { type: 'boolean' },
+      limit: { type: 'number', description: 'default 20' } } } },
+  { name: 'awaiting_reply', description: 'Your sent emails that got no answer yet (no later message in the same conversation from someone else). Use this before saying "they never replied".',
+    inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'look back, default 14' },
+      account: { type: 'string' }, limit: { type: 'number', description: 'default 30' } } } },
+  { name: 'needs_response', description: 'Emails from real people waiting for YOUR answer: not replied, and you have not written in that conversation since. Skips no-reply/notification senders.',
+    inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'look back, default 14' },
+      account: { type: 'string' }, limit: { type: 'number', description: 'default 30' } } } },
+  { name: 'get_thread', description: 'Whole conversation for a message, oldest first, from all folders including Sent.',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
+      bodies: { type: 'boolean', description: 'include message text (clipped), default true' } }, required: ['id', 'account', 'mailbox'] } },
+  { name: 'list_attachments', description: 'Attachments of a message: name, size, MIME type.',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' } },
+      required: ['id', 'account', 'mailbox'] } },
   { name: 'read_message', description: 'Полный текст письма. id/account/mailbox берутся из list_messages или search_messages.',
     inputSchema: { type: 'object', properties: {
       id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
@@ -146,7 +240,8 @@ var TOOLS = [
   { name: 'move_messages', description: 'Move messages (ids from one folder) to another folder.',
     inputSchema: { type: 'object', properties: {
       ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
-      to_mailbox: { type: 'string' }, to_account: { type: 'string', description: 'default: same account' } },
+      to_mailbox: { type: 'string' }, to_account: { type: 'string', description: 'default: same account' },
+      dry_run: { type: 'boolean', description: 'only show what would move' } },
       required: ['ids', 'account', 'mailbox', 'to_mailbox'] } },
   { name: 'create_rule', description: 'Create a Mail rule. conditions: [{field: from|to|cc|subject|any_recipient|content, op: contains|not_contains|begins|ends|equals, value}]. Actions: move_to {account, mailbox}, mark_read, flag, delete, stop. Created disabled first, enabled after conditions are set.',
     inputSchema: { type: 'object', properties: {
@@ -162,11 +257,12 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'list_note_folders', description: 'Apple Notes accounts and folders with note counts.',
     inputSchema: { type: 'object', properties: {} } },
-  { name: 'list_notes', description: 'Notes sorted by last modified. Without folder — all notes.',
+  { name: 'list_notes', description: 'Notes sorted by last modified. Without folder — all notes except Recently Deleted.',
     inputSchema: { type: 'object', properties: { folder: { type: 'string' }, account: { type: 'string', description: 'Notes account, e.g. iCloud' },
-      limit: { type: 'number', description: 'default 30' } } } },
-  { name: 'search_notes', description: 'Search notes by title and text (substring).',
-    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number', description: 'default 20' } }, required: ['query'] } },
+      limit: { type: 'number', description: 'default 30' }, include_deleted: { type: 'boolean', description: 'also show Recently Deleted' } } } },
+  { name: 'search_notes', description: 'Search notes by title and text (substring). Skips Recently Deleted unless include_deleted.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number', description: 'default 20' },
+      include_deleted: { type: 'boolean' } }, required: ['query'] } },
   { name: 'read_note', description: 'Full note as plain text (id from list_notes/search_notes). html:true returns the HTML body.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' }, html: { type: 'boolean' } }, required: ['id'] } },
   { name: 'create_note', description: 'Create a note. body is plain text (lines kept) unless html:true. Default folder: Notes.',
@@ -181,12 +277,27 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: { uid: { type: 'string' }, calendar: { type: 'string' } }, required: ['uid'] } },
   { name: 'delete_messages', description: 'Переместить письма в Корзину (не безвозвратно). ids — список id из одной папки.',
     inputSchema: { type: 'object', properties: {
-      ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' } },
+      ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
+      dry_run: { type: 'boolean', description: 'only show what would be deleted' } },
       required: ['ids', 'account', 'mailbox'] } },
-  { name: 'set_read', description: 'Пометить письмо прочитанным/непрочитанным.',
+  { name: 'set_read', description: 'Mark one (id) or many (ids) messages read/unread.',
     inputSchema: { type: 'object', properties: {
-      id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' }, read: { type: 'boolean' } },
-      required: ['id', 'account', 'mailbox', 'read'] } }
+      id: { type: 'number' }, ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
+      read: { type: 'boolean' } }, required: ['account', 'mailbox', 'read'] } },
+  { name: 'set_flag', description: 'Flag/unflag messages, optional color: red, orange, yellow, green, blue, purple, gray.',
+    inputSchema: { type: 'object', properties: {
+      ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
+      flagged: { type: 'boolean' }, color: { type: 'string' } }, required: ['ids', 'account', 'mailbox', 'flagged'] } },
+  { name: 'forward_message', description: 'Forward a message (with its attachments) with an optional note on top. draft=true opens it in Mail instead of sending.',
+    inputSchema: { type: 'object', properties: {
+      id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
+      to: { type: 'string' }, cc: { type: 'string' }, bcc: { type: 'string' }, body: { type: 'string' }, draft: { type: 'boolean' } },
+      required: ['id', 'account', 'mailbox', 'to'] } },
+  { name: 'save_attachments', description: 'Save a message\'s attachments to disk (default: the folder from extension settings, else ~/Downloads). Never overwrites.',
+    inputSchema: { type: 'object', properties: {
+      id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
+      names: { type: 'array', items: { type: 'string' }, description: 'only these files; default all' },
+      dir: { type: 'string' } }, required: ['id', 'account', 'mailbox'] } }
 ];
 
 var HANDLERS = {
@@ -211,11 +322,127 @@ var HANDLERS = {
     return summarize(getMailbox(a.account, a.mailbox).messages, a.limit || 20, !!a.unread_only);
   },
   search_messages: function (a) {
-    var q = String(a.query);
-    var spec = getMailbox(a.account, a.mailbox).messages.whose({ _or: [
-      { subject: { _contains: q } }, { sender: { _contains: q } } ] });
-    return summarize(spec, a.limit || 20, false);
+    var limit = a.limit || 20, conds = [], q = a.query ? String(a.query) : '';
+    if (q) {
+      var where = a['in'] || 'subject_sender', t = [];
+      if (where === 'subject' || where === 'subject_sender' || where === 'any') t.push({ subject: { _contains: q } });
+      if (where === 'sender' || where === 'subject_sender' || where === 'any') t.push({ sender: { _contains: q } });
+      if (where === 'body' || where === 'any') t.push({ content: { _contains: q } });
+      conds.push(t.length > 1 ? { _or: t } : t[0]);
+    }
+    if (a.from_date) conds.push({ dateReceived: { _greaterThan: new Date(a.from_date) } });
+    if (a.to_date) conds.push({ dateReceived: { _lessThan: new Date(a.to_date) } });
+    if (a.unread) conds.push({ readStatus: false });
+    if (a.flagged) conds.push({ flaggedStatus: true });
+    if (!conds.length && !a.has_attachments) throw new Error('Give a query or at least one filter');
+    var boxes;
+    if (a.all_mailboxes) boxes = allMailboxes(a.account || DEFAULT_ACCOUNT || null).filter(function (mb) { try { return !SKIP_BOXES.test(mb.name()) || SENT_BOXES.test(mb.name()); } catch (e) { return false; } });
+    else boxes = [getMailbox(a.account, a.mailbox)];
+    var rows = [];
+    boxes.forEach(function (mb) {
+      var spec = conds.length ? mb.messages.whose(conds.length > 1 ? { _and: conds } : conds[0]) : mb.messages;
+      rows = rows.concat(rowsOf(spec));
+    });
+    rows.sort(newestFirst);
+    var out = [];
+    for (var k = 0; k < rows.length && out.length < limit; k++) {
+      var r = rows[k];
+      if (a.has_attachments) { var n = 0; try { n = r.spec[r.i].mailAttachments().length; } catch (e) {} if (!n) continue; }
+      out.push(rowOut(r));
+    }
+    return out;
   },
+  awaiting_reply: function (a) {
+    var days = a.days || 14, limit = a.limit || 30, cutoff = new Date(Date.now() - days * 864e5), me = myAddresses();
+    var sentBoxes = allMailboxes(a.account).filter(function (mb) { try { return SENT_BOXES.test(mb.name()); } catch (e) { return false; } });
+    // latest message I sent per conversation
+    var mine = {};
+    sentBoxes.forEach(function (mb) {
+      var spec = mb.messages.whose({ dateSent: { _greaterThan: cutoff } }), ids; try { ids = spec.id(); } catch (e) { return; }
+      if (!ids.length) return;
+      var subs = spec.subject(), dates = spec.dateSent(), to = [];
+      try { to = spec.toRecipients.address(); } catch (e) {}
+      ids.forEach(function (id, i) {
+        var k = normSubject(subs[i]); if (!k) return;
+        if (!mine[k] || dates[i] > mine[k].date) mine[k] = { id: id, mailbox: mb.name(), account: (function () { try { return mb.account().name(); } catch (e) { return null; } })(),
+          subject: subs[i], date: dates[i], to: (to[i] || []).join(', ') };
+      });
+    });
+    // latest message from someone else per conversation (any folder except sent/trash/junk)
+    var theirs = {};
+    allMailboxes(a.account).forEach(function (mb) {
+      var name; try { name = mb.name(); } catch (e) { return; }
+      if (SKIP_BOXES.test(name)) return;
+      var spec = mb.messages.whose({ dateReceived: { _greaterThan: cutoff } }), ids; try { ids = spec.id(); } catch (e) { return; }
+      if (!ids.length) return;
+      var subs = spec.subject(), dates = spec.dateReceived(), from = spec.sender();
+      ids.forEach(function (id, i) {
+        if (me[addrOf(from[i])]) return;
+        var k = normSubject(subs[i]); if (!k || !mine[k]) return;
+        if (!theirs[k] || dates[i] > theirs[k]) theirs[k] = dates[i];
+      });
+    });
+    var out = [];
+    Object.keys(mine).forEach(function (k) {
+      var s = mine[k];
+      if (theirs[k] && theirs[k] > s.date) return;
+      out.push({ to: s.to, subject: s.subject, sent: iso(s.date), days_waiting: Math.floor((Date.now() - s.date) / 864e5),
+        id: s.id, account: s.account, mailbox: s.mailbox });
+    });
+    out.sort(function (x, y) { return y.days_waiting - x.days_waiting; });
+    return out.slice(0, limit);
+  },
+  needs_response: function (a) {
+    var days = a.days || 14, limit = a.limit || 30, cutoff = new Date(Date.now() - days * 864e5), me = myAddresses();
+    var BOT = /(^|[._+-])(no-?reply|do-?not-?reply|donotreply|notifications?|notify|alerts?|alerting|mailer|mailer-daemon|postmaster|bounces?|newsletters?|news|marketing|updates?|team|hello|info|support|billing|invoices?|receipts?|statements?|security|accounts?|feedback|reviews|probe|automated|system)([._+-]|@)/i;
+    // when I last wrote in each conversation
+    var lastMine = {};
+    allMailboxes(a.account).forEach(function (mb) {
+      var name; try { name = mb.name(); } catch (e) { return; }
+      if (!SENT_BOXES.test(name)) return;
+      var spec = mb.messages.whose({ dateSent: { _greaterThan: cutoff } }), ids; try { ids = spec.id(); } catch (e) { return; }
+      if (!ids.length) return;
+      var subs = spec.subject(), dates = spec.dateSent();
+      ids.forEach(function (_, i) { var k = normSubject(subs[i]); if (k && (!lastMine[k] || dates[i] > lastMine[k])) lastMine[k] = dates[i]; });
+    });
+    var spec = a.account ? getMailbox(a.account, 'INBOX').messages : mail().inbox.messages;
+    var rows = rowsOf(spec.whose({ dateReceived: { _greaterThan: cutoff } }));
+    var latest = {};
+    rows.forEach(function (r) {
+      var from = addrOf(r.from);
+      if (me[from] || BOT.test(from)) return;
+      var k = normSubject(r.subject) || ('#' + r.id);
+      if (!latest[k] || r.date > latest[k].date) latest[k] = r;
+    });
+    var out = [];
+    Object.keys(latest).forEach(function (k) {
+      var r = latest[k];
+      if (r.replied) return;
+      if (lastMine[k] && lastMine[k] > r.date) return;
+      var o = rowOut(r); o.waiting_days = Math.floor((Date.now() - r.date) / 864e5); out.push(o);
+    });
+    out.sort(function (x, y) { return y.waiting_days - x.waiting_days; });
+    return out.slice(0, limit);
+  },
+  get_thread: function (a) {
+    var m = getMessage(a), key = normSubject(m.subject()), withBodies = a.bodies !== false;
+    if (!key) return [HANDLERS.read_message(a)];
+    var core = key.length > 60 ? key.slice(0, 60) : key, rows = [];
+    allMailboxes(a.account).forEach(function (mb) {
+      var name; try { name = mb.name(); } catch (e) { return; }
+      if (/^(trash|deleted items|deleted messages|корзина|junk|junk mail|spam|спам)$/i.test(name)) return;
+      rowsOf(mb.messages.whose({ subject: { _contains: core } })).forEach(function (r) { if (normSubject(r.subject) === key) rows.push(r); });
+    });
+    var seen = {};
+    rows.sort(function (x, y) { return (x.date || 0) - (y.date || 0); });
+    return rows.filter(function (r) { var k = r.date + '|' + addrOf(r.from); if (seen[k]) return false; seen[k] = 1; return true; })
+      .map(function (r) {
+        var o = rowOut(r);
+        if (withBodies) { try { o.body = clip(r.spec[r.i].content(), 4000); } catch (e) {} }
+        return o;
+      });
+  },
+  list_attachments: function (a) { return attachmentsOf(getMessage(a)); },
   read_message: function (a) {
     var m = getMessage(a);
     var r = {
@@ -225,7 +452,7 @@ var HANDLERS = {
       replied: (function () { try { return m.wasRepliedTo(); } catch (e) { return null; } })(),
       forwarded: (function () { try { return m.wasForwarded(); } catch (e) { return null; } })(),
       flagged: (function () { try { return m.flaggedStatus(); } catch (e) { return null; } })(),
-      attachments: (function () { try { return m.mailAttachments().map(function (x) { return x.name(); }); } catch (e) { return []; } })(),
+      attachments: attachmentsOf(m),
       body: clip(m.content(), 60000)
     };
     if (a.mark_read) m.readStatus = true;
@@ -255,7 +482,56 @@ var HANDLERS = {
     r.send();
     return 'Ответ отправлен на: ' + m.sender();
   },
-  set_read: function (a) { getMessage(a).readStatus = !!a.read; return 'ok'; },
+  set_read: function (a) {
+    var mb = getMailbox(a.account, a.mailbox), ids = a.ids || (a.id != null ? [a.id] : []), ok = 0, failed = [];
+    if (!ids.length) throw new Error('Give id or ids');
+    ids.forEach(function (id) { try { mb.messages.byId(Number(id)).readStatus = !!a.read; ok++; } catch (e) { failed.push(id); } });
+    return { updated: ok, failed: failed };
+  },
+  set_flag: function (a) {
+    var COLORS = { red: 0, orange: 1, yellow: 2, green: 3, blue: 4, purple: 5, gray: 6, grey: 6 };
+    if (a.color && !(String(a.color).toLowerCase() in COLORS)) throw new Error('Unknown color. Use: ' + Object.keys(COLORS).join(', '));
+    var mb = getMailbox(a.account, a.mailbox), ok = 0, failed = [];
+    (a.ids || []).forEach(function (id) {
+      try {
+        var m = mb.messages.byId(Number(id));
+        if (a.flagged) { m.flaggedStatus = true; if (a.color) m.flagIndex = COLORS[String(a.color).toLowerCase()]; }
+        else { m.flaggedStatus = false; try { m.flagIndex = -1; } catch (e) {} }
+        ok++;
+      } catch (e) { failed.push(id); }
+    });
+    return { updated: ok, failed: failed };
+  },
+  forward_message: function (a) {
+    var M = mail(), m = getMessage(a);
+    var f = M.forward(m, { openingWindow: !!a.draft });
+    addRecipients(f, 'toRecipients', M.ToRecipient, a.to);
+    addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
+    addRecipients(f, 'bccRecipients', M.BccRecipient, a.bcc);
+    if (a.body) {
+      var orig = ''; try { orig = f.content() || ''; } catch (e) {}
+      if (!orig) {
+        orig = '---------- Forwarded message ----------\nFrom: ' + m.sender() + '\nDate: ' + (iso(m.dateReceived()) || '') +
+          '\nSubject: ' + m.subject() + '\n\n' + (function () { try { return m.content(); } catch (e) { return ''; } })();
+      }
+      f.content = a.body + '\n\n' + orig;
+    }
+    if (a.draft) { M.activate(); return 'Forward opened in Mail — check it and press Send.'; }
+    f.send();
+    return 'Forwarded to: ' + toList(a.to).join(', ');
+  },
+  save_attachments: function (a) {
+    var M = mail(), m = getMessage(a), dir = a.dir || SAVE_DIR;
+    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
+    var want = a.names && a.names.length ? a.names : null, saved = [], skipped = [];
+    m.mailAttachments().forEach(function (x) {
+      var n = x.name();
+      if (want && want.indexOf(n) < 0) return;
+      try { var p = uniquePath(dir, n); M.save(x, { in: Path(p) }); saved.push(p); } catch (e) { skipped.push(n + ': ' + e.message); }
+    });
+    if (!saved.length && !skipped.length) throw new Error(want ? 'No attachments with those names' : 'Message has no attachments');
+    return { saved: saved, failed: skipped };
+  },
   list_calendars: function () {
     var C = cal();
     return C.calendars().map(function (c) { var w = true; try { w = c.writable(); } catch (e) {} return { name: c.name(), writable: w }; });
@@ -302,6 +578,7 @@ var HANDLERS = {
   },
   move_messages: function (a) {
     var M = mail(), src = getMailbox(a.account, a.mailbox), dst = getMailbox(a.to_account || a.account, a.to_mailbox), ok = 0, failed = [];
+    if (a.dry_run) return { dry_run: true, would_move_to: (a.to_account || a.account) + ' / ' + a.to_mailbox, messages: idsSummary(src, a.ids) };
     (a.ids || []).forEach(function (id) {
       try { M.move(src.messages.byId(Number(id)), { to: dst }); ok++; } catch (e) { failed.push(id); }
     });
@@ -359,12 +636,13 @@ var HANDLERS = {
   },
   list_notes: function (a) {
     var spec = a.folder ? noteFolder(a.account, a.folder).notes : notes().notes;
-    return noteSummary(spec, a.limit || 30);
+    // an explicitly requested folder is shown as is (even Recently Deleted)
+    return noteSummary(spec, a.limit || 30, !!a.folder || !!a.include_deleted);
   },
   search_notes: function (a) {
     var q = String(a.query);
     var spec = notes().notes.whose({ _or: [{ name: { _contains: q } }, { plaintext: { _contains: q } }] });
-    return noteSummary(spec, a.limit || 20);
+    return noteSummary(spec, a.limit || 20, !!a.include_deleted);
   },
   read_note: function (a) {
     var n = getNote(a.id), r = { id: a.id, title: n.name() };
@@ -405,6 +683,7 @@ var HANDLERS = {
   },
   delete_messages: function (a) {
     var M = mail(), mb = getMailbox(a.account, a.mailbox), ok = 0, failed = [];
+    if (a.dry_run) return { dry_run: true, would_move_to_trash: idsSummary(mb, a.ids) };
     (a.ids || []).forEach(function (id) {
       try { M.delete(mb.messages.byId(Number(id))); ok++; } catch (e) { failed.push(id); }
     });
@@ -413,9 +692,10 @@ var HANDLERS = {
 };
 
 // ---------- two public tools: read / write ----------
-var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'list_rules', 'list_calendars', 'list_events',
+var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
+  'awaiting_reply', 'needs_response', 'get_thread', 'list_attachments', 'list_rules', 'list_calendars', 'list_events',
   'list_note_folders', 'list_notes', 'search_notes', 'read_note'];
-var WRITE_ACTIONS = ['send_email', 'reply_message', 'set_read', 'delete_messages', 'create_mailbox', 'move_messages',
+var WRITE_ACTIONS = ['send_email', 'reply_message', 'forward_message', 'set_read', 'set_flag', 'save_attachments', 'delete_messages', 'create_mailbox', 'move_messages',
   'create_rule', 'set_rule_enabled', 'delete_rule', 'create_event', 'delete_event',
   'create_note', 'update_note', 'delete_note'];
 
@@ -442,7 +722,9 @@ var PUBLIC_TOOLS = [
   publicTool('write', 'Change Apple Mail, Calendar and Notes: send, reply, organize mail, rules, events, notes.', WRITE_ACTIONS,
     { title: 'Change mail, calendar & notes', readOnlyHint: false, destructiveHint: true, openWorldHint: true })
 ];
+if (READ_ONLY) PUBLIC_TOOLS = PUBLIC_TOOLS.filter(function (t) { return t.name === 'read'; });
 function callPublic(name, a) {
+  if (name === 'write' && READ_ONLY) throw new Error('Read-only mode is on (extension settings) — changes are disabled.');
   var allowed = name === 'read' ? READ_ACTIONS : name === 'write' ? WRITE_ACTIONS : null;
   if (!allowed) throw new Error('Нет такого инструмента: ' + name);
   if (allowed.indexOf(a.action) < 0) throw new Error('action "' + a.action + '" недоступен в ' + name + '. Доступно: ' + allowed.join(', '));
@@ -458,7 +740,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.2.0' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.3.0' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
