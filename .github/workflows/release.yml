@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check server syntax
+        run: node --check server/apple-mail-mcp.js
+
+      - name: Sync manifest version with tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          jq --arg v "$VER" --arg r "https://github.com/${GITHUB_REPOSITORY}.git" \
+            '.version=$v | .repository.url=$r' manifest.json > m.tmp && mv m.tmp manifest.json
+
+      - name: Validate and pack
+        run: |
+          npx -y @anthropic-ai/mcpb validate manifest.json
+          npx -y @anthropic-ai/mcpb pack . apple-mail-mcp.mcpb
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" apple-mail-mcp.mcpb \
+            --title "$GITHUB_REF_NAME" --generate-notes
