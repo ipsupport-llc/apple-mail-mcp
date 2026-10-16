@@ -565,6 +565,41 @@ function run(argv) {
     eq(call('read', { action: 'list_messages', args: {} }).items.map(function (x) { return x.account; }).sort(), ['Work', 'iCloud']);
   });
 
+  // ---- third review round
+  test('update_note refuses when attachments cannot be read', function () {
+    var n = NotesApp.addNote(NotesApp.icloud.folders.byName('Notes'), 'Odd');
+    Object.defineProperty(n, 'attachments', { get: function () { throw new Error('AppleEvent timed out'); } });
+    has(callErr('write', { action: 'update_note', args: { id: n.id(), body: 'x' } }), 'Could not tell whether the note has attachments');
+  });
+  test('explicit attachment names are not merged into a third file', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf', 'b.pdf', 'a.pdf, b.pdf'] });
+    eq(call('write', { action: 'save_attachments', args: { id: m.id(), names: ['a.pdf', 'b.pdf'] } }).saved.length, 2);
+  });
+  test('time without zone is local time, with a note', function () {
+    has(call('write', { action: 'create_event', args: { title: 'x', start: '2026-10-27T10:00:00', calendar: 'Home' } }).notes.join(' '), 'time zone');
+  });
+  test('create_event takes a recurrence rule and refuses garbage', function () {
+    call('write', { action: 'create_event', args: { title: 'Weekly', start: '2026-10-27T10:00:00Z', calendar: 'Home', recurrence: 'FREQ=WEEKLY;BYDAY=TU' } });
+    eq(Cal.home.events.items[Cal.home.events.items.length - 1].recurrence(), 'FREQ=WEEKLY;BYDAY=TU');
+    has(callErr('write', { action: 'create_event', args: { title: 'x', start: '2026-10-27T10:00:00Z', calendar: 'Home', recurrence: 'every tuesday' } }), 'not an iCalendar rule');
+  });
+  test('a calendar that cannot be read is reported, not shown as empty', function () {
+    Object.defineProperty(Cal.home.events, 'startDate', { value: function () { throw new Error('timeout'); } });
+    has(call('read', { action: 'list_events', args: { from: '2026-10-12', calendar_index: 0 } }).notes.join(' '), 'could not be read');
+  });
+  test('an unexpandable series that ended before the window is skipped', function () {
+    Cal.addEvent(Cal.home, { summary: 'Old', startDate: new Date(2020, 0, 6, 9), endDate: new Date(2020, 0, 6, 10), uid: 'o', recurrence: 'FREQ=MONTHLY;BYSETPOS=1;BYDAY=MO;UNTIL=20210101' });
+    eq(call('read', { action: 'list_events', args: { from: '2026-10-01', to: '2026-10-31', calendar_index: 0 } }).count, 0);
+  });
+  test('RRULE: DAILY with BYMONTHDAY=-1 is the last day of each month', function () {
+    var occ = expandRecurrence('FREQ=DAILY;BYMONTHDAY=-1', new Date(2026, 0, 1, 9), new Date(2026, 0, 1, 10), [], new Date(2026, 0, 1), new Date(2026, 3, 1));
+    eq(occ.map(function (o) { return o.start.getMonth() + 1 + '-' + o.start.getDate(); }), ['1-31', '2-28', '3-31']);
+  });
+  test('a rule that forwards is not deleted (it could not be rebuilt)', function () {
+    Mail.rules.items.push(item({ name: 'Fwd', enabled: true, allConditionsMustBeMet: true, ruleConditions: [], shouldMoveMessage: false, markRead: false, deleteMessage: false, stopEvaluatingRules: false, forwardMessage: 'boss@example.com' }));
+    has(callErr('write', { action: 'delete_rule', args: { name: 'Fwd' } }), 'set_rule_enabled');
+  });
+
   // ---- registry sanity
   test('every action has a handler, a tool and arg specs with known types', function () {
     var types = ['string', 'integer', 'boolean', 'id', 'ids', 'list', 'addresses', 'date', 'object', 'objects'];

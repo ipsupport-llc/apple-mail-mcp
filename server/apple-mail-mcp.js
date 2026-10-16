@@ -160,7 +160,9 @@ function parseWhen(v, endOfDay, strict) {
     else {
       if (+m[4] > 23 || +m[5] > 59 || +(m[6] || 0) > 59) return null;
       var t = new Date(trim(v).replace(' ', 'T'));
-      return isNaN(t.getTime()) ? null : t;
+      if (isNaN(t.getTime())) return null;
+      if (m[7] == null) t.localTime = true; // no offset: JavaScript reads it as this Mac's local time
+      return t;
     }
   } else if (strict) return null;
   if (day) {
@@ -499,6 +501,18 @@ function summary(found) {
 }
 // AppleScript string literal (create_rule builds an AppleScript)
 function q(v) { return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '\\n').replace(/\t/g, '\\t') + '"'; }
+// Rule actions create_rule cannot rebuild (so a copy of the rule would be incomplete).
+function ruleExtras(r) {
+  var out = [];
+  [['forward', function () { return r.forwardMessage(); }], ['redirect', function () { return r.redirectMessage(); }],
+    ['reply', function () { return r.replyText(); }], ['copy to a folder', function () { return r.shouldCopyMessage(); }],
+    ['play a sound', function () { return r.playSound(); }], ['run a script', function () { return r.runScript(); }],
+    ['colour', function () { return r.highlightTextUsingColor() || r.colorMessage() !== 'none'; }]].forEach(function (p) {
+    var v = safe(p[1], null);
+    if (v && v !== 'none' && !(v && typeof v === 'object' && !Object.keys(v).length)) out.push(p[0]);
+  });
+  return out;
+}
 // AppleScript reference for a resolved mailbox, nested ones as "mailbox "B" of mailbox "A" of account …"
 function mailboxRef(box) {
   return box.path.split('/').reverse().map(function (p) { return 'mailbox ' + q(p); }).join(' of ') + ' of account ' + q(box.account);
@@ -659,9 +673,12 @@ var MAIL = {
   list_rules: function () {
     return mail().rules().map(function (r) {
       var mv = safe(function () { if (!r.shouldMoveMessage()) return null; var mb = r.moveMessage(); return mb.account().name() + ' / ' + mb.name(); }, null);
-      return { name: r.name(), enabled: r.enabled(), match: r.allConditionsMustBeMet() ? 'all' : 'any',
+      var o = { name: r.name(), enabled: r.enabled(), match: r.allConditionsMustBeMet() ? 'all' : 'any',
         conditions: safe(function () { return r.ruleConditions(); }, []).map(function (c) { return { field: c.ruleType(), op: c.qualifier(), value: c.expression() }; }),
-        move_to: mv, mark_read: r.markRead(), 'delete': r.deleteMessage(), stop: r.stopEvaluatingRules() };
+        move_to: mv, mark_read: r.markRead(), flag: safe(function () { return r.markFlagged(); }, null), 'delete': r.deleteMessage(), stop: r.stopEvaluatingRules() };
+      var other = ruleExtras(r);
+      if (other.length) o.other_actions = other;
+      return o;
     });
   },
 
@@ -770,7 +787,7 @@ var MAIL = {
     var all = m.mailAttachments(), names = all.map(function (x) { return x.name(); }), saved = [], failed = [];
     if (!all.length) fail('This message has no attachments.');
     var want = a.names || null;
-    if (want && want.length > 1 && names.indexOf(want.join(', ')) >= 0) want = [want.join(', ')]; // one file name that contains a comma
+    if (want && want.length > 1 && !want.some(function (w) { return names.indexOf(w) >= 0; }) && names.indexOf(want.join(', ')) >= 0) want = [want.join(', ')]; // one file name with a comma, split by mistake
     if (want) {
       var missing = want.filter(function (w) { return names.indexOf(w) < 0; });
       if (missing.length === want.length) fail('No attachments named ' + missing.join(', ') + '.', 'Attachments: ' + names.join(', ') + '.');
@@ -838,9 +855,12 @@ var MAIL = {
     r.enabled = a.enabled;
     return { rule: r.name(), enabled: a.enabled };
   },
-  // Mail keeps no copy of a deleted rule, so the result carries the whole rule for create_rule.
+  // Mail keeps no copy of a deleted rule, so the result carries the whole rule for create_rule — and a rule
+  // that create_rule could not rebuild is not deleted at all.
   delete_rule: function (a) {
-    var r = getRule(a.name), n = r.name(), copy = MAIL.list_rules().filter(function (x) { return x.name === n; })[0];
+    var r = getRule(a.name), n = r.name(), extras = ruleExtras(r);
+    if (extras.length) fail('Rule "' + n + '" also does: ' + extras.join(', ') + '. That could not be recreated after deleting, so it was not deleted.', 'Turn it off instead: set_rule_enabled with enabled:false.');
+    var copy = MAIL.list_rules().filter(function (x) { return x.name === n; })[0];
     mail()['delete'](r);
     note('Rules cannot be restored in Mail. The deleted rule is in "copy"; tell the user, and recreate it with create_rule if asked.');
     return { deleted_rule: n, copy: copy };
@@ -876,6 +896,7 @@ function pickCalendar(a, list) { // null when neither calendar nor calendar_inde
 // Supports FREQ, INTERVAL, COUNT, UNTIL, BYDAY (also with ordinals like 3MO, -1FR), BYMONTH, BYMONTHDAY.
 // Returns null for rules with other parts; the series is then listed once, unexpanded.
 var WEEKDAYS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+function tzOffset(d) { var m = -d.getTimezoneOffset(), s = m < 0 ? '-' : '+'; m = Math.abs(m); return s + ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + m % 60).slice(-2); }
 function parseRule(rule) {
   var r = {};
   String(rule).split(';').forEach(function (kv) { var p = kv.split('='); if (p[0]) r[p[0].toUpperCase()] = p[1] || ''; });
@@ -921,7 +942,9 @@ function expandRecurrence(rule, start, end, excluded, from, to) {
     var out = [];
     if (r.freq === 'DAILY') {
       var d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + period * r.interval);
-      if (inMonth(d.getMonth()) && (!r.byday || r.byday.some(function (b) { return b.wd === d.getDay(); })) && (!r.bymd || r.bymd.indexOf(d.getDate()) >= 0))
+      var dim = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      if (inMonth(d.getMonth()) && (!r.byday || r.byday.some(function (b) { return b.wd === d.getDay(); })) &&
+          (!r.bymd || r.bymd.some(function (x) { return (x > 0 ? x : dim + x + 1) === d.getDate(); })))
         out.push(at(d.getFullYear(), d.getMonth(), d.getDate()));
     } else if (r.freq === 'WEEKLY') {
       var monday = new Date(start.getFullYear(), start.getMonth(), start.getDate() - ((start.getDay() + 6) % 7) + period * 7 * r.interval);
@@ -954,18 +977,26 @@ function expandRecurrence(rule, start, end, excluded, from, to) {
 // Some calendars (subscribed ones especially) answer each Apple Event slowly, and a `whose` query is
 // re-run for every property. So: three bulk reads per calendar (start, end, rule), cached while the
 // event count stays the same, and the remaining fields only for the events that fall in the window.
-var EVENT_CACHE = {}, EVENT_CACHE_MS = 10 * 60e3;
-function eventTimes(c, fresh) { // bulk start/end/rule/uid of one calendar, by index
+// The cache is short-lived (a model asking twice in a row) and dropped by our own writes; edits made in Calendar
+// meanwhile show up within a minute.
+var EVENT_CACHE = {}, EVENT_CACHE_MS = 60e3;
+function eventTimes(c, fresh) { // bulk start/end/rule/uid of one calendar, by index; null if Calendar would not say
   var key = c.index + '\u0000' + c.name, count = safe(function () { return c.ref.events.length; }, -1), hit = EVENT_CACHE[key];
   if (!fresh && hit && hit.count === count && Date.now() - hit.at < EVENT_CACHE_MS) return hit;
-  function bulk(f) { return safe(function () { return c.ref.events[f](); }, []); }
-  hit = { count: count, at: Date.now(), start: bulk('startDate'), end: bulk('endDate'), rule: bulk('recurrence'), uid: bulk('uid') };
+  try {
+    hit = { count: count, at: Date.now(), start: c.ref.events.startDate(), end: c.ref.events.endDate(), rule: c.ref.events.recurrence(), uid: c.ref.events.uid() };
+  } catch (e) {
+    if (e instanceof Cancelled) throw e;
+    delete EVENT_CACHE[key];
+    return null;
+  }
   return (EVENT_CACHE[key] = hit);
 }
 // Occurrences in [from, to) of one calendar, repeating events expanded. Cached rows are read by index, so each
 // detail read checks that the index still holds the same uid; if not, the calendar is read again, once.
 function eventsIn(c, from, to, retried) {
   var t = eventTimes(c, retried), out = [], moved = false;
+  if (!t) { note('Calendar "' + c.name + '" could not be read, so its events are missing here.'); return out; }
   for (var i = 0; i < t.start.length && !moved; i++) {
     var start = t.start[i], end = t.end[i], rule = t.rule[i] || '';
     if (!start || start >= to) continue;
@@ -984,6 +1015,8 @@ function eventsIn(c, from, to, retried) {
     var base = { title: safe(function () { return ev.summary(); }, ''), uid: t.uid[i], location: safe(function () { return ev.location(); }, null) || null,
       all_day: !!safe(function () { return ev.alldayEvent(); }, false), recurring: !!rule, calendar: c.name, calendar_index: c.index };
     if (occ === null) { // a rule this server cannot expand: the series may well be in the window, so say so
+      var until = /UNTIL=(\d{4})(\d{2})(\d{2})/.exec(rule);
+      if (until && new Date(+until[1], +until[2] - 1, +until[3], 23, 59, 59) < from) continue; // it ended before the window
       out.push(ext(base, { start: start, end: end, recurrence: rule, note: 'repeats by a rule this server cannot expand (series start shown); check Calendar for the dates in this range' }));
       continue;
     }
@@ -1028,7 +1061,11 @@ var CALENDAR = {
     }
     if (end <= start) fail('"end" (' + iso(end) + ') must be after "start" (' + iso(start) + ').');
     if (end - start > 366 * 864e5) fail('Events can be at most one year long here; this one runs ' + iso(start) + ' → ' + iso(end) + '.', 'Check "start" and "end".');
+    if (a.start.localTime || (a.end && a.end.localTime)) note('No time zone given: used this Mac\'s time zone (UTC' + tzOffset(start) + ').');
+    if (a.recurrence && parseRule(a.recurrence) === null && !/^FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;[A-Z]+=[A-Z0-9,+-]+)*$/.test(a.recurrence))
+      fail('"recurrence" is not an iCalendar rule.', 'Give an RRULE like FREQ=WEEKLY;BYDAY=MO, or leave it out.');
     var props = { summary: a.title, startDate: start, endDate: end, alldayEvent: allDay };
+    if (a.recurrence) props.recurrence = a.recurrence;
     if (a.location) props.location = a.location;
     if (a.notes) props.description = a.notes;
     var ev = cal().Event(props);
@@ -1045,7 +1082,9 @@ var CALENDAR = {
         hits.push({ ref: ev, calendar: c, recurrence: rule, copy: {
           title: safe(function () { return ev.summary(); }, ''), start: iso(safe(function () { return ev.startDate(); }, null)), end: iso(safe(function () { return ev.endDate(); }, null)),
           all_day: safe(function () { return ev.alldayEvent(); }, null), location: safe(function () { return ev.location(); }, null) || null,
-          notes: safe(function () { return ev.description(); }, null) || null, recurrence: rule || null } });
+          notes: safe(function () { return ev.description(); }, null) || null, recurrence: rule || null,
+          excluded_dates: rule ? safe(function () { return ev.excludedDates(); }, []).map(iso) : undefined,
+          alarms: safe(function () { return ev.displayAlarms().length + ev.soundAlarms().length; }, null) } });
       });
     });
     if (!hits.length) fail('No event with uid ' + a.uid + (one ? ' in "' + one.name + '"' : '') + '.', 'Uids come from list_events.');
@@ -1057,7 +1096,7 @@ var CALENDAR = {
     checkCancelled();
     cal()['delete'](h.ref);
     EVENT_CACHE = {};
-    note('Calendar has no trash for events. The deleted event is in "copy"; recreate it with create_event if the user asks.');
+    note('Calendar has no trash for events. The deleted event is in "copy"; recreate it with create_event if the user asks (alarms, invitees and skipped dates are not restored).');
     return { deleted: h.copy.title, calendar: h.calendar.name, whole_series: !!h.recurrence, copy: h.copy };
   }
 };
@@ -1138,8 +1177,9 @@ var NOTES_APP = {
   update_note: function (a) {
     var n = getNote(a.id);
     if (safe(function () { return n.passwordProtected(); }, false)) fail('The note is locked.', 'The user must unlock it in Notes first.');
-    var files = safe(function () { return n.attachments.length; }, 0);
-    if (!a.append && files) fail('The note has ' + files + ' attachment(s) (images, files, drawings); replacing its body would drop them. Nothing was changed.', 'Use append:true to add text, or let the user edit the note in Notes.');
+    var files = a.append ? 0 : safe(function () { return n.attachments.length; }, null);
+    if (files === null) fail('Could not tell whether the note has attachments, so nothing was changed.', 'Try again, or use append:true to add text.');
+    if (files) fail('The note has ' + files + ' attachment(s) (images, files, drawings); replacing its body would drop them. Nothing was changed.', 'Use append:true to add text, or let the user edit the note in Notes.');
     var add = toNoteHtml(a.body, a.html);
     if (a.append) n.body = n.body() + add;
     else n.body = '<div><h1>' + esc(a.title || n.name()) + '</h1></div>' + add;
@@ -1235,7 +1275,7 @@ var ACTIONS = {
   create_event: { tool: 'write', guard: true, desc: 'Create an event. start/end: ISO 8601 with time zone, e.g. 2026-10-27T13:00:00-06:00. A date alone makes an all-day event.',
     args: { title: { type: 'string', required: true }, start: { type: 'date', required: true, aliases: ['from', 'date', 'when', 'start_date', 'on'] }, end: { type: 'date', desc: 'default: 1 hour after start', aliases: ['to', 'end_date', 'until'] },
       all_day: { type: 'boolean' }, calendar: { type: 'string', desc: 'needed when several calendars are writable' }, calendar_index: { type: 'integer', min: 0 },
-      location: { type: 'string' }, notes: { type: 'string' } }, run: CALENDAR.create_event },
+      location: { type: 'string' }, notes: { type: 'string' }, recurrence: { type: 'string', desc: 'iCalendar RRULE, e.g. FREQ=WEEKLY;BYDAY=MO' } }, run: CALENDAR.create_event },
   delete_event: { tool: 'write', guard: true, desc: 'Delete an event by uid (from list_events). Permanent in Calendar; the result holds a copy. A repeating event needs whole_series:true.',
     args: { uid: { type: 'string', required: true, aliases: ['id'] }, calendar: { type: 'string' }, calendar_index: { type: 'integer', min: 0 }, whole_series: { type: 'boolean', 'default': false } }, run: CALENDAR.delete_event },
   // ---- Notes
