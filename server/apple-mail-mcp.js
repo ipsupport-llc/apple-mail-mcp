@@ -245,7 +245,7 @@ var HANDLERS = {
     return mail().rules().map(function (r) {
       var mv = null; try { if (r.shouldMoveMessage()) { var mb = r.moveMessage(); mv = mb.account().name() + ' / ' + mb.name(); } } catch (e) {}
       return { name: r.name(), enabled: r.enabled(), match: r.allConditionsMustBeMet() ? 'all' : 'any',
-        conditions: r.ruleConditions().map(function (c) { return { type: c.ruleType(), qualifier: c.qualifier(), value: c.expression() }; }),
+        conditions: (function () { var cs = null; try { cs = r.ruleConditions(); } catch (e) {} return (cs || []).map(function (c) { return { type: c.ruleType(), qualifier: c.qualifier(), value: c.expression() }; }); })(),
         move_to: mv, mark_read: r.markRead(), delete: r.deleteMessage(), stop: r.stopEvaluatingRules() };
     });
   },
@@ -263,30 +263,45 @@ var HANDLERS = {
     return { moved: ok, failed: failed, to: (a.to_account || a.account) + ' / ' + a.to_mailbox };
   },
   create_rule: function (a) {
-    var M = mail();
+    // Built via AppleScript: Mail's JXA bridge can't add rule conditions reliably.
     var FIELD = { from: 'from header', to: 'to header', cc: 'cc header', subject: 'subject header', any_recipient: 'any recipient', content: 'message content' };
     var OP = { contains: 'does contain value', not_contains: 'does not contain value', begins: 'begins with value', ends: 'ends with value', equals: 'equal to value' };
+    if (!a.name) throw new Error('name is required');
     if (!a.conditions || !a.conditions.length) throw new Error('At least one condition is required');
     a.conditions.forEach(function (c) {
       if (!FIELD[c.field]) throw new Error('Unknown field "' + c.field + '". Use: ' + Object.keys(FIELD).join(', '));
       if (c.op && !OP[c.op]) throw new Error('Unknown op "' + c.op + '". Use: ' + Object.keys(OP).join(', '));
     });
-    var dst = a.move_to ? getMailbox(a.move_to.account, a.move_to.mailbox) : null;
-    M.rules.push(M.Rule({ name: a.name, enabled: false }));
-    var r = M.rules.byName(a.name);
-    // a fresh rule may come with a default condition — remove it so nothing broad slips through
-    r.ruleConditions().forEach(function (c) { M.delete(c); });
+    if (a.move_to) getMailbox(a.move_to.account, a.move_to.mailbox); // validate target exists
+    try { mail().rules.byName(a.name).name(); throw new Error('exists'); } catch (e) {
+      if (e.message === 'exists') throw new Error('A rule named "' + a.name + '" already exists');
+    }
+    function q(v) { return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; }
+    var props = ['name:' + q(a.name), 'enabled:false', 'all conditions must be met:' + ((a.match || 'all') === 'all')];
+    if (a.move_to) props.push('should move message:true', 'move message:(mailbox ' + q(a.move_to.mailbox) + ' of account ' + q(a.move_to.account) + ')');
+    if (a.mark_read) props.push('mark read:true');
+    if (a.flag) props.push('mark flagged:true');
+    if (a.delete) props.push('delete message:true');
+    if (a.stop) props.push('stop evaluating rules:true');
+    var lines = ['tell application "Mail"',
+      '  set r to make new rule at end of rules with properties {' + props.join(', ') + '}',
+      '  tell r'];
+    // Mail may add a default condition to a new rule; drop it first
+    lines.push('    delete every rule condition');
     a.conditions.forEach(function (c) {
-      r.ruleConditions.push(M.RuleCondition({ ruleType: FIELD[c.field], qualifier: OP[c.op || 'contains'], expression: c.value }));
+      lines.push('    make new rule condition at end of rule conditions with properties {rule type:' + FIELD[c.field] +
+        ', qualifier:' + OP[c.op || 'contains'] + ', expression:' + q(c.value) + '}');
     });
-    r.allConditionsMustBeMet = (a.match || 'all') === 'all';
-    if (dst) { r.moveMessage = dst; r.shouldMoveMessage = true; }
-    if (a.mark_read) r.markRead = true;
-    if (a.flag) r.markFlagged = true;
-    if (a.delete) r.deleteMessage = true;
-    if (a.stop) r.stopEvaluatingRules = true;
-    if (r.ruleConditions().length !== a.conditions.length) { M.delete(r); throw new Error('Could not set rule conditions; rule removed'); }
-    r.enabled = a.enabled !== false;
+    lines.push('  end tell',
+      '  if (count of rule conditions of r) is not ' + a.conditions.length + ' then',
+      '    delete r',
+      '    error "Could not set rule conditions; rule removed"',
+      '  end if');
+    if (a.enabled !== false) lines.push('  set enabled of r to true');
+    lines.push('end tell');
+    var app = Application.currentApplication();
+    app.includeStandardAdditions = true;
+    app.runScript(lines.join('\n'), { in: 'AppleScript' });
     return HANDLERS.list_rules().filter(function (x) { return x.name === a.name; })[0];
   },
   set_rule_enabled: function (a) { var r = mail().rules.byName(a.name); r.name(); r.enabled = !!a.enabled; return 'ok'; },
@@ -353,7 +368,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.1.1' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.1.2' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
