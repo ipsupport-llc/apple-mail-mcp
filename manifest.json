@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "apple-mail-mcp",
   "display_name": "Apple Mail, Calendar & Notes",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Read, search, send and organize Apple Mail, manage Apple Calendar and Apple Notes — locally, with zero dependencies.",
   "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS. No Node, Python or Homebrew. Two tools: `read` (never changes anything) and `write` (send and reply, folders and rules, Trash, calendar events, notes).",
   "author": {

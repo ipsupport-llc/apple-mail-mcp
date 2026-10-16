@@ -29,16 +29,21 @@ function noteFolder(account, folder) {
   return f;
 }
 function getNote(id) { var n = notes().notes.byId(String(id)); n.name(); return n; }
-function noteSummary(spec, limit) {
+var DELETED_FOLDERS = /^(Recently Deleted|Недавно удал[её]нные)$/i;
+function noteSummary(spec, limit, includeDeleted) {
   var ids = spec.id();
   if (!ids.length) return [];
   var names = spec.name(), mod = spec.modificationDate();
   var idx = ids.map(function (_, i) { return i; });
   idx.sort(function (x, y) { return (mod[y] || 0) - (mod[x] || 0); });
-  return idx.slice(0, limit).map(function (i) {
-    var folder = null; try { folder = spec[i].container().name(); } catch (e) {}
-    return { id: ids[i], title: names[i], folder: folder, modified: iso(mod[i]) };
-  });
+  var out = [];
+  for (var k = 0; k < idx.length && out.length < limit; k++) {
+    var i = idx[k], folder = null;
+    try { folder = spec[i].container().name(); } catch (e) {}
+    if (!includeDeleted && folder && DELETED_FOLDERS.test(folder)) continue;
+    out.push({ id: ids[i], title: names[i], folder: folder, modified: iso(mod[i]) });
+  }
+  return out;
 }
 
 // ---------- IO ----------
@@ -162,11 +167,12 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'list_note_folders', description: 'Apple Notes accounts and folders with note counts.',
     inputSchema: { type: 'object', properties: {} } },
-  { name: 'list_notes', description: 'Notes sorted by last modified. Without folder — all notes.',
+  { name: 'list_notes', description: 'Notes sorted by last modified. Without folder — all notes except Recently Deleted.',
     inputSchema: { type: 'object', properties: { folder: { type: 'string' }, account: { type: 'string', description: 'Notes account, e.g. iCloud' },
-      limit: { type: 'number', description: 'default 30' } } } },
-  { name: 'search_notes', description: 'Search notes by title and text (substring).',
-    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number', description: 'default 20' } }, required: ['query'] } },
+      limit: { type: 'number', description: 'default 30' }, include_deleted: { type: 'boolean', description: 'also show Recently Deleted' } } } },
+  { name: 'search_notes', description: 'Search notes by title and text (substring). Skips Recently Deleted unless include_deleted.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number', description: 'default 20' },
+      include_deleted: { type: 'boolean' } }, required: ['query'] } },
   { name: 'read_note', description: 'Full note as plain text (id from list_notes/search_notes). html:true returns the HTML body.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' }, html: { type: 'boolean' } }, required: ['id'] } },
   { name: 'create_note', description: 'Create a note. body is plain text (lines kept) unless html:true. Default folder: Notes.',
@@ -359,12 +365,13 @@ var HANDLERS = {
   },
   list_notes: function (a) {
     var spec = a.folder ? noteFolder(a.account, a.folder).notes : notes().notes;
-    return noteSummary(spec, a.limit || 30);
+    // an explicitly requested folder is shown as is (even Recently Deleted)
+    return noteSummary(spec, a.limit || 30, !!a.folder || !!a.include_deleted);
   },
   search_notes: function (a) {
     var q = String(a.query);
     var spec = notes().notes.whose({ _or: [{ name: { _contains: q } }, { plaintext: { _contains: q } }] });
-    return noteSummary(spec, a.limit || 20);
+    return noteSummary(spec, a.limit || 20, !!a.include_deleted);
   },
   read_note: function (a) {
     var n = getNote(a.id), r = { id: a.id, title: n.name() };
@@ -458,7 +465,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.2.0' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.2.1' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });

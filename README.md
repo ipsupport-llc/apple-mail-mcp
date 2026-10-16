@@ -52,7 +52,7 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | `list_calendars` | Calendars and whether they are writable |
 | `list_events` | Events in a date range, with `uid` |
 | `list_note_folders` | Notes accounts and folders with note counts |
-| `list_notes` | Notes by last modified, optionally in one folder |
+| `list_notes` | Notes by last modified, optionally in one folder (Recently Deleted hidden unless asked) |
 | `search_notes` | Search notes by title and text |
 | `read_note` | Full note as plain text (or HTML) |
 
