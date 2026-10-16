@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ipsupport-llc/apple-mail-mcp",
+  "title": "Apple Mail, Calendar & Notes",
+  "description": "Apple Mail, Calendar and Notes on macOS: read, search, triage and send mail, events and notes. Local, no dependencies.",
+  "repository": {
+    "url": "https://github.com/ipsupport-llc/apple-mail-mcp",
+    "source": "github"
+  },
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/ipsupport-llc/apple-mail-mcp/releases/download/v0.0.0/apple-mail-mcp.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

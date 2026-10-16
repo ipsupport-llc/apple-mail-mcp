@@ -3,13 +3,26 @@
 set -euo pipefail
 
 CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-[ -f "$CFG" ] || { echo "No Claude config found."; exit 0; }
+[ -s "$CFG" ] || { echo "No Claude config found."; exit 0; }
 
 BAK="$CFG.bak.$(date +%Y%m%d%H%M%S)"
 cp "$CFG" "$BAK"
-if plutil -remove mcpServers.apple-mail "$CFG" 2>/dev/null; then
+RESULT=$(CFG="$CFG" /usr/bin/osascript -l JavaScript - <<'JS'
+ObjC.import('Foundation');
+var path = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('CFG'));
+var cfg = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)));
+var had = !!(cfg.mcpServers && cfg.mcpServers['apple-mail']);
+if (had) {
+  delete cfg.mcpServers['apple-mail'];
+  if (!$(JSON.stringify(cfg, null, 2) + '\n').writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null)) throw new Error('Could not write ' + path);
+}
+had ? 'removed' : 'absent';
+JS
+)
+if [ "$RESULT" = "removed" ]; then
   echo "Removed apple-mail from Claude config. Backup: $BAK"
   echo "Quit Claude (Cmd+Q) and open it again."
 else
+  rm -f "$BAK"
   echo "apple-mail was not configured."
 fi

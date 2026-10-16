@@ -28,6 +28,7 @@ This extension talks to the apps on your Mac directly. That means:
 - **Nothing to install.** No Node, no Python, no Homebrew. It runs on JavaScript for Automation, which ships with every Mac.
 - **Your mail stays on your Mac.** The extension has no network code. Claude only sees what it asks for.
 - **Two permission prompts, not thirty.** Everything is grouped into a `read` tool and a `write` tool. Approve `read` once and forget about it.
+- **Works with small local models too.** Arguments are forgiving (`"true"`, `"3 days ago"`, `folder` instead of `mailbox`), and every mistake comes back with a plain "how to fix" line instead of a dead end.
 
 ## What Claude can do
 
@@ -37,9 +38,9 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 
 | | |
 | --- | --- |
-| **Needs response** | Emails from real people you haven't answered yet. Ignores no-reply senders, alerts and newsletters. |
-| **Awaiting reply** | Emails *you* sent that nobody has answered. Great for follow-ups. |
-| **Conversation view** | A whole thread in order — their messages and your replies — from every folder, including Sent. |
+| **Needs response** | Emails from real people you haven't answered yet. Ignores no-reply senders and notifications. |
+| **Awaiting reply** | Emails *you* sent that none of the recipients has answered. Great for follow-ups. |
+| **Conversation view** | A whole thread in order — their messages and your replies — from every folder, including Sent. Messages count as one conversation only when the subject *and* the people match. |
 | **Replied / forwarded / flagged** | Every message in a list shows whether you already replied, so Claude doesn't nag you twice. |
 
 ### 🔎 Read & search
@@ -48,24 +49,24 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 | --- | --- |
 | **Inbox and folders** | Latest messages in any folder, unread counts, all accounts. |
 | **Search** | By subject, sender or message text; by date range; unread, flagged or with attachments; in one folder or everywhere. |
-| **Read a message** | Headers, recipients, plain-text body and a list of attachments. |
-| **Attachments** | See names, sizes and types — and save them to disk. |
+| **Read a message** | Headers, recipients, plain-text body (long ones in pages) and a list of attachments. |
+| **Attachments** | See names, sizes and types — and save them into your attachments folder. |
 
 ### ✉️ Write
 
 | | |
 | --- | --- |
 | **Send** | New emails with To / Cc / Bcc, from any of your addresses. |
-| **Reply / reply all** | With the original quoted below. |
-| **Forward** | With attachments and an optional note on top. |
-| **Draft mode** | Any of the above can open in Mail for you to check and press *Send* yourself. |
+| **Reply / reply all** | With the original quoted below. Opens as a draft you check and send. |
+| **Forward** | With attachments and an optional note on top. Opens as a draft too. |
+| **Draft mode** | Replies and forwards open in Mail by default, because Mail itself picks their recipients and quote. New emails can open as drafts as well. |
 
 ### 🗂 Organize
 
 | | |
 | --- | --- |
 | **Folders** | Create folders, including nested ones (`Alerts/Kubernetes`). |
-| **Move & delete** | Move messages between folders or to Trash — with a **dry run** that shows what would change first. |
+| **Move & delete** | Move messages between folders or to the account's Trash — with a **dry run** that shows what would change first. |
 | **Flags & read status** | Flag in any colour, mark read or unread — one message or a batch. |
 | **Rules** | Create, list, enable, disable and delete Mail rules, so new mail sorts itself. |
 
@@ -73,7 +74,7 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 
 | | |
 | --- | --- |
-| **Events** | See what's on for any date range across all calendars; create and delete events. |
+| **Events** | See what's on for any date range across all calendars, repeating events included; create and delete events. A date alone makes an all-day event. |
 
 ### 📝 Notes
 
@@ -108,9 +109,13 @@ Claude asks before using each tool. We recommend **Allow for all tasks** on `rea
 
 ## Safety
 
-- **Deleting is never permanent.** Mail goes to Trash, notes go to Recently Deleted, both recoverable.
+- **Mail and notes are never deleted for good.** Mail goes to the account's Trash, notes go to Recently Deleted. Where that isn't possible — an account without a Trash folder, a Notes account without Recently Deleted (e.g. Exchange), something already in the trash, a locked note — the extension refuses and says why. Mail rules that delete are only allowed when every account keeps deleted mail in its Trash.
+- **Calendar events and rules have no trash in macOS.** Deleting one returns a full copy of it, so it can be recreated on request.
+- **Replies and forwards are drafts by default.** Mail fills in their recipients and quote, so you see the real thing in Mail and press *Send* yourself.
+- **No accidental repeats.** The same send, reply, delete or create call twice within 15 minutes is refused — a stuck model can't send an email five times.
+- **Repeating events are deleted only on purpose.** Deleting one removes the whole series, so the extension asks for `whole_series: true`.
 - **Dry runs.** Bulk moves and deletes can be previewed before they happen.
-- **Attachments are never overwritten.** A file that already exists gets `(1)`, `(2)`… appended.
+- **Attachments stay in one place.** They are saved only inside the attachments folder from the settings and are never overwritten — an existing file gets `(1)`, `(2)`… appended.
 - **Watch out for instructions hidden in emails.** Anything Claude reads becomes part of its context, and a malicious email could try to tell it to do something. Keep `write` on manual approval, or turn on read-only mode, if that worries you.
 - **One readable file.** The whole server is [`server/apple-mail-mcp.js`](server/apple-mail-mcp.js), with no dependencies and no network calls.
 
@@ -136,7 +141,7 @@ Open **System Settings → Privacy & Security → Automation** and allow Claude 
 <details>
 <summary><b>Tool reference</b> (for the curious)</summary>
 
-Two tools, each taking `{ "action": "...", "args": { ... } }`.
+Two tools, each taking `{ "action": "...", "args": { ... } }`. The full list of arguments is in each tool's description.
 
 **`read`** — never changes anything
 
@@ -153,7 +158,7 @@ Two tools, each taking `{ "action": "...", "args": { ... } }`.
 | `list_mailboxes` | Folders with unread counts |
 | `list_rules` | Mail rules with conditions and actions |
 | `list_calendars` | Calendars |
-| `list_events` | Events in a date range |
+| `list_events` | Events in a date range, repeating events expanded |
 | `list_note_folders` | Notes accounts and folders |
 | `list_notes` | Recent notes |
 | `search_notes` | Search notes |
@@ -163,20 +168,22 @@ Two tools, each taking `{ "action": "...", "args": { ... } }`.
 
 | Action | Purpose |
 | --- | --- |
-| `send_email` | New email (or draft) |
-| `reply_message` | Reply / reply all (or draft) |
-| `forward_message` | Forward with attachments (or draft) |
+| `send_email` | New email (`draft: true` opens it instead) |
+| `reply_message` | Reply / reply all — opens as a draft in Mail by default, `draft: false` sends |
+| `forward_message` | Forward with attachments — draft by default, `draft: false` sends |
 | `set_read` | Mark read / unread, one or many |
 | `set_flag` | Flag / unflag with colour |
 | `move_messages` | Move to another folder (`dry_run` available) |
-| `delete_messages` | Move to Trash (`dry_run` available) |
-| `save_attachments` | Save attachments to disk |
+| `delete_messages` | Move to the account's Trash (`dry_run` available) |
+| `save_attachments` | Save attachments into the attachments folder |
 | `create_mailbox` | New folder |
-| `create_rule` · `set_rule_enabled` · `delete_rule` | Mail rules |
-| `create_event` · `delete_event` | Calendar events |
+| `create_rule` · `set_rule_enabled` · `delete_rule` | Mail rules (a deleted rule comes back as a copy) |
+| `create_event` · `delete_event` | Calendar events (`whole_series: true` to delete a repeating one; a deleted event comes back as a copy) |
 | `create_note` · `update_note` · `delete_note` | Notes |
 
-Message ids come from list and search results and are scoped to `account` + `mailbox`.
+Message ids come from list and search results; pass `account` and `mailbox` from the same row. If the folder is wrong, the message is found by its id anyway.
+
+Small models get help: argument names are matched loosely (`folder` → `mailbox`, `messageId` → `id`), values are converted (`"false"`, `"1,2,3"`, `"tomorrow"`), short action names work (`reply`, `search`), and every result explains in `notes` how the call was read. Anything that sends, deletes or creates is never guessed: there, unclear input is an error with a hint.
 </details>
 
 <details>
@@ -192,12 +199,21 @@ cd ~/code/apple-mail-mcp
 ./uninstall.sh   # removes the entry
 ```
 
+`install.sh` takes the same settings as the extension: `--read-only` / `--no-read-only`, `--account Work`, `--save-dir ~/Documents/Attachments`. Running it again keeps earlier settings unless you change them (`--reset` forgets them).
+
 Restart Claude after `install.sh`. Don't use the manual install and the `.mcpb` at the same time.
+
+**Tests** never touch your mail: unit tests run the server against fake Mail, Calendar and Notes apps, protocol tests only speak JSON-RPC. CI runs both on macOS for every pull request.
+
+```sh
+/usr/bin/osascript -l JavaScript tests/unit.js server/apple-mail-mcp.js
+python3 tests/protocol.py
+```
 
 **Releasing:** push a tag and GitHub Actions validates the manifest, builds the `.mcpb` and attaches it to a release.
 
 ```sh
-git tag v1.3.1 && git push --tags
+git tag v1.4.0 && git push origin v1.4.0
 ```
 </details>
 

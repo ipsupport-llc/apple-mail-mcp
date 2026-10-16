@@ -2,14 +2,16 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*"]
 
 permissions:
   contents: write
 
 jobs:
   bundle:
-    runs-on: ubuntu-26.04
+    runs-on: macos-latest
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
 
@@ -17,19 +19,26 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Check server syntax
-        run: node --check server/apple-mail-mcp.js
+      - name: Tests
+        run: |
+          /usr/bin/osascript -l JavaScript tests/unit.js server/apple-mail-mcp.js
+          python3 tests/protocol.py
 
-      - name: Sync manifest version with tag
+      - name: Set the version from the tag
         run: |
           VER="${GITHUB_REF_NAME#v}"
           jq --arg v "$VER" --arg r "https://github.com/${GITHUB_REPOSITORY}.git" \
             '.version=$v | .repository.url=$r' manifest.json > m.tmp && mv m.tmp manifest.json
+          grep -q "^var VERSION = '" server/apple-mail-mcp.js
+          sed -i '' "s/^var VERSION = '[^']*';/var VERSION = '$VER';/" server/apple-mail-mcp.js
+          grep "^var VERSION" server/apple-mail-mcp.js
 
       - name: Validate and pack
+        id: pack
         run: |
           npx -y @anthropic-ai/mcpb validate manifest.json
           npx -y @anthropic-ai/mcpb pack . apple-mail-mcp.mcpb
+          echo "sha256=$(shasum -a 256 apple-mail-mcp.mcpb | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         env:
@@ -37,3 +46,37 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" apple-mail-mcp.mcpb \
             --title "$GITHUB_REF_NAME" --generate-notes
+
+  # Lists the release in the MCP Registry (registry.modelcontextprotocol.io).
+  # Off until the repository variable MCP_REGISTRY_PUBLISH is set to "true".
+  registry:
+    needs: bundle
+    if: vars.MCP_REGISTRY_PUBLISH == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PUBLISHER_VERSION: v1.8.1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fill in server.json
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/apple-mail-mcp.mcpb"
+          jq --arg v "$VER" --arg u "$URL" --arg s "${{ needs.bundle.outputs.sha256 }}" \
+            '.version=$v | .packages[0].identifier=$u | .packages[0].fileSha256=$s' server.json > s.tmp && mv s.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: |
+          BASE="https://github.com/modelcontextprotocol/registry/releases/download/$PUBLISHER_VERSION"
+          curl -fsSLO "$BASE/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL "$BASE/registry_${PUBLISHER_VERSION#v}_checksums.txt" | grep ' mcp-publisher_linux_amd64.tar.gz$' | sha256sum -c -
+          tar xzf mcp-publisher_linux_amd64.tar.gz mcp-publisher
+
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
