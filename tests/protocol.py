@@ -114,6 +114,76 @@ with open(path) as f:
         check("exits when stdin is a file", False, "timed out")
 os.remove(path)
 
+
+# worker process: ping answers while a call runs, a stuck call times out, a running call can be cancelled
+import select
+import threading
+
+
+def live(env):
+    """Start the server; returns (send(obj), wait(id, seconds) -> (reply, seconds), close())."""
+    proc = subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=dict(os.environ, **env))
+    got, t0 = {}, time.time()
+
+    def reader():
+        for line in proc.stdout:
+            if line.strip():
+                r = json.loads(line)
+                got[r.get("id")] = (r, time.time() - t0)
+    threading.Thread(target=reader, daemon=True).start()
+
+    def send(obj):
+        proc.stdin.write((json.dumps(obj) + "\n").encode()); proc.stdin.flush()
+
+    def wait(i, seconds):
+        end = time.time() + seconds
+        while time.time() < end and i not in got:
+            time.sleep(0.05)
+        return got.get(i, (None, None))
+
+    def close():
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill(); failures.append("server with worker did not exit on EOF")
+        return proc.stderr.read().decode()
+    return send, wait, close, got
+
+
+send, wait, close, got = live({"APPLE_MAIL_TEST": "1", "APPLE_MAIL_TIMEOUT": "3"})
+send(INIT); wait(1, 20)
+call = lambda i, secs: send({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "read", "arguments": {"action": "__sleep", "args": {"seconds": secs}}}})
+call(20, 1)
+r, _ = wait(20, 20)
+check("worker runs a call", r and "slept" in r["result"]["content"][0]["text"], str(r))
+t_start = time.time()
+call(21, 30)
+time.sleep(0.5)
+send({"jsonrpc": "2.0", "id": 22, "method": "ping"})
+r, at = wait(22, 5)
+check("ping answers while a call runs", r is not None and "result" in r, str(r))
+r, at = wait(21, 15)
+check("stuck call times out with isError", r and r["result"].get("isError") and "did not answer within 3 s" in r["result"]["content"][0]["text"], str(r))
+check("timeout comes on time", r is not None and time.time() - t_start < 8, f"{time.time() - t_start:.1f}s")
+call(23, 1)
+r, _ = wait(23, 20)
+check("next call works after a timeout (new worker)", r and "slept" in r["result"]["content"][0]["text"], str(r))
+call(24, 30)
+time.sleep(1)
+send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 24}})
+send({"jsonrpc": "2.0", "id": 25, "method": "ping"})
+wait(25, 5)
+call(26, 1)
+r, _ = wait(26, 20)
+check("a cancelled running call gets no response", 24 not in got, str(got.get(24)))
+check("calls work after a cancellation", r and "slept" in r["result"]["content"][0]["text"], str(r))
+log = close()
+check("stderr logs each call with app and time", "→ 20 read.__sleep [Test]" in log and "TIMEOUT" in log and "cancelled" in log, log[-600:])
+
+# Apple Event errors are explained (fake -1743 through the in-process path is covered in unit tests)
+
 # install.sh / uninstall.sh against a throwaway HOME
 import shutil
 import tempfile

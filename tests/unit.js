@@ -29,8 +29,10 @@ function coll(items, owner) {
   function refresh() { for (var i = 0; i < 200; i++) delete c[i]; items.forEach(function (x, i) { c[i] = x; }); Object.defineProperty(c, 'length', { value: items.length, configurable: true }); }
   refresh();
   ['id', 'name', 'subject', 'sender', 'dateReceived', 'dateSent', 'readStatus', 'wasRepliedTo', 'wasForwarded', 'flaggedStatus', 'messageId',
-    'summary', 'startDate', 'endDate', 'location', 'uid', 'alldayEvent', 'recurrence', 'excludedDates', 'modificationDate', 'emailAddresses'].forEach(function (p) {
-    Object.defineProperty(c, p, { value: function () { return items.map(function (x) { return x[p](); }); }, configurable: true, writable: true });
+    'summary', 'startDate', 'endDate', 'location', 'uid', 'alldayEvent', 'recurrence', 'excludedDates', 'modificationDate', 'emailAddresses',
+    'enabled', 'allConditionsMustBeMet', 'shouldMoveMessage', 'markRead', 'markFlagged', 'deleteMessage', 'stopEvaluatingRules', 'forwardMessage',
+    'redirectMessage', 'replyText', 'shouldCopyMessage', 'playSound', 'highlightTextUsingColor', 'colorMessage', 'ruleType', 'qualifier', 'expression'].forEach(function (p) {
+    Object.defineProperty(c, p, { value: function () { return items.map(function (x) { return typeof x[p] === 'function' ? x[p]() : undefined; }); }, configurable: true, writable: true });
   });
   c.toRecipients = { address: function () { return items.map(function (x) { return x.toRecipients().map(function (r) { return r.address(); }); }); } };
   c.ccRecipients = { address: function () { return items.map(function (x) { return x.ccRecipients().map(function (r) { return r.address(); }); }); } };
@@ -503,7 +505,7 @@ function run(argv) {
     has(callErr('write', { action: 'create_rule', args: { name: 'r', conditions: [{ field: 'from', value: 'x' }], 'delete': true } }), 'remove mail for good in: Work');
     has(callErr('write', { action: 'create_rule', args: { name: 'r', conditions: [{ field: 'from', value: 'x' }], move_to: { mailbox: 'Receipts' } } }), 'move_to.account');
     eq(mailboxRef({ path: 'A/B', account: 'X' }), 'mailbox "B" of mailbox "A" of account "X"');
-    Mail.rules.items.push(item({ name: 'Purge', enabled: false, deleteMessage: true }));
+    Mail.rules.push(item({ name: 'Purge', enabled: false, deleteMessage: true }));
     has(callErr('write', { action: 'set_rule_enabled', args: { name: 'Purge', enabled: true } }), 'remove mail for good');
   });
   test('needs_response skips messages without a sender', function () {
@@ -530,7 +532,7 @@ function run(argv) {
     eq(r.copy.title, 'Dentist'); eq(r.copy.location, 'Main St');
   });
   test('delete_rule returns a copy of the rule', function () {
-    Mail.rules.items.push(item({ name: 'Old', enabled: true, allConditionsMustBeMet: true, ruleConditions: [], shouldMoveMessage: false, markRead: true, deleteMessage: false, stopEvaluatingRules: false }));
+    Mail.rules.push(item({ name: 'Old', enabled: true, allConditionsMustBeMet: true, ruleConditions: coll([]), shouldMoveMessage: false, markRead: true, deleteMessage: false, stopEvaluatingRules: false }));
     var r = call('write', { action: 'delete_rule', args: { name: 'old' } });
     eq(r.copy.name, 'Old'); eq(r.copy.mark_read, true);
   });
@@ -596,8 +598,63 @@ function run(argv) {
     eq(occ.map(function (o) { return o.start.getMonth() + 1 + '-' + o.start.getDate(); }), ['1-31', '2-28', '3-31']);
   });
   test('a rule that forwards is not deleted (it could not be rebuilt)', function () {
-    Mail.rules.items.push(item({ name: 'Fwd', enabled: true, allConditionsMustBeMet: true, ruleConditions: [], shouldMoveMessage: false, markRead: false, deleteMessage: false, stopEvaluatingRules: false, forwardMessage: 'boss@example.com' }));
+    Mail.rules.push(item({ name: 'Fwd', enabled: true, allConditionsMustBeMet: true, ruleConditions: coll([]), shouldMoveMessage: false, markRead: false, deleteMessage: false, stopEvaluatingRules: false, forwardMessage: 'boss@example.com' }));
     has(callErr('write', { action: 'delete_rule', args: { name: 'Fwd' } }), 'set_rule_enabled');
+  });
+
+  // ---- LLMTray requests
+  test('reply dry_run: Reply-To, reply-all without my addresses, full body; nothing is created', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ from: 'Anna <anna@example.com>', to: ['me@icloud.com', 'bob@example.com'], cc: ['carol@example.com'], subject: 'Plan', body: 'line1' });
+    m._props.replyTo = 'Anna Desk <desk@example.com>';
+    var r = call('write', { action: 'reply_message', args: { id: m.id(), body: 'ok', reply_all: true, preview: true } });
+    eq(r.dry_run, true); eq(r.would_send.to, ['Anna Desk <desk@example.com>']); eq(r.would_send.cc.map(function (x) { return x.replace(/.*</, '').replace('>', ''); }), ['bob@example.com', 'carol@example.com']);
+    eq(r.would_send.subject, 'Re: Plan'); has(r.would_send.body, '> line1');
+    eq(Mail.sent.length, 0);
+  });
+  test('a reply Mail would address differently is not sent', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ from: 'Anna <anna@example.com>' });
+    m._props.replyTo = 'desk@example.com'; // the fake Mail replies to the sender, not to Reply-To
+    has(callErr('write', { action: 'reply_message', args: { id: m.id(), body: 'ok', draft: false } }), 'Nothing was sent');
+    eq(Mail.sent.length, 0);
+  });
+  test('send results show what Mail has: from, recipients, subject, size, time', function () {
+    var r = call('write', { action: 'send_email', args: { to: 'b@example.com', cc: 'c@example.com', subject: 'Hi', body: 'hello' } });
+    eq(r.status, 'Sent.'); eq(r.to, ['b@example.com']); eq(r.cc, ['c@example.com']); eq(r.body_chars, 5); ok(r.sent_at);
+    var d = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 'Hi2', body: 'x', dry_run: true } });
+    eq(d.would_send.subject, 'Hi2'); eq(Mail.sent.length, 1);
+  });
+  test('forward dry_run lists attachments and the full text', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ subject: 'Report', attachments: ['r.pdf'], body: 'numbers' });
+    var r = call('write', { action: 'forward_message', args: { id: m.id(), to: 'b@example.com', body: 'fyi', dry_run: true } });
+    eq(r.would_send.subject, 'Fwd: Report'); eq(r.would_send.attachments, ['r.pdf']); has(r.would_send.body, 'numbers');
+  });
+  test('paths: ~, ${HOME} and $HOME are expanded', function () {
+    var home = ObjC.unwrap($.NSHomeDirectory());
+    eq(stdPath('${HOME}/Downloads'), stdPath(home + '/Downloads')); eq(stdPath('$HOME/x'), stdPath(home + '/x')); eq(stdPath('~/y'), stdPath(home + '/y'));
+  });
+  test('Apple Event errors say what to do', function () {
+    has(formatError({ message: 'Not authorized to send Apple events to Mail.', errorNumber: -1743 }, 'Mail'), 'Privacy & Security › Automation');
+    has(formatError({ message: 'Application isn’t running.', errorNumber: -600 }, 'Notes'), 'Open Notes once');
+    has(formatError({ message: 'Connection is invalid.', errorNumber: -609 }, 'Calendar'), 'connection to Calendar was lost');
+  });
+  test('tool text is compact, English, and lists every action', function () {
+    PUBLIC_TOOLS.forEach(function (t) {
+      ok(!/[А-Яа-яЁё]/.test(t.description), t.name + ' has Cyrillic');
+      actionsOf(t.name).forEach(function (n) { has(t.description, '• ' + n + '('); });
+    });
+    var size = JSON.stringify(PUBLIC_TOOLS).length;
+    ok(size < 8000, 'catalog is ' + size + ' bytes');
+  });
+
+  test('large mailbox: newest messages come from a date window, not a full read', function () {
+    var box = Mail.box('iCloud', 'Receipts'), old = Date.now() - 400 * 864e5;
+    for (var i = 0; i < 400; i++) box.add({ subject: 'old ' + i, date: new Date(old + i * 1000) });
+    ['a', 'b', 'c', 'd'].forEach(function (x, i) { box.add({ subject: 'new ' + x, date: new Date(Date.now() - (i + 1) * 3600e3) }); });
+    var reads = 0, orig = box.messages.whose;
+    box.messages.whose = function (c) { var r = orig(c); var id = r.id; r.id = function () { reads++; return id(); }; return r; };
+    var r = call('read', { action: 'list_messages', args: { account: 'iCloud', mailbox: 'Receipts', limit: 3 } });
+    eq(r.items.map(function (x) { return x.subject; }), ['new a', 'new b', 'new c']);
+    ok(reads <= 3, 'read ' + reads + ' windows');
   });
 
   // ---- registry sanity

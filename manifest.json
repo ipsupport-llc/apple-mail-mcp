@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "apple-mail-mcp",
   "display_name": "Apple Mail, Calendar & Notes",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Apple Mail, Calendar and Notes for your AI assistant — read, search, triage and send, locally, with zero dependencies.",
   "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS: no Node, Python or Homebrew. Two tools — `read` (never changes anything) and `write` (send, reply, forward, organize, rules, events, notes) — so you approve permissions twice, not thirty times. Finds emails waiting for your reply and sent emails nobody answered.",
   "author": {
