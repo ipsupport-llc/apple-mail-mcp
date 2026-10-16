@@ -45,14 +45,23 @@ function note(s) { if (NOTES.indexOf(s) < 0) NOTES.push(s); }
 function iso(d) { try { return d ? new Date(d).toISOString() : null; } catch (e) { return null; } }
 function lower(s) { return String(s == null ? '' : s).toLowerCase(); }
 function trim(s) { return String(s).trim(); }
-function safe(f, fallback) { try { return f(); } catch (e) { return fallback; } }
+function safe(f, fallback) { try { return f(); } catch (e) { if (e instanceof Cancelled) throw e; return fallback; } }
 function exists(ref) { return safe(function () { ref.name(); return true; }, false); }
 function ext(base, more) { var o = {}, k; for (k in base) o[k] = base[k]; for (k in more) o[k] = more[k]; return o; }
 function addrOf(s) { var m = /<([^>]+)>/.exec(s || ''); return trim(m ? m[1] : String(s || '')).toLowerCase(); }
-function toList(v) {
+function toList(v) { // "a, b; c" → [a, b, c]; separators inside quotes or <…> do not split
   if (v == null || v === '') return [];
   if (Array.isArray(v)) return v.map(trim).filter(Boolean);
-  return String(v).split(/[,;\n]/).map(trim).filter(Boolean);
+  var out = [], cur = '', quoted = false, angle = false, str = String(v);
+  for (var i = 0; i < str.length; i++) {
+    var ch = str[i];
+    if (ch === '"') quoted = !quoted;
+    else if (ch === '<') angle = true;
+    else if (ch === '>') angle = false;
+    if (!quoted && !angle && /[,;\n]/.test(ch)) { out.push(cur); cur = ''; } else cur += ch;
+  }
+  out.push(cur);
+  return out.map(trim).filter(Boolean);
 }
 function page(s, offset, max) { // long text in pages: {text, total_chars, next_offset?}
   s = String(s || '');
@@ -131,7 +140,10 @@ function snake(k) { return String(k).replace(/([a-z0-9])([A-Z])/g, '$1_$2').repl
 var TRUE_WORDS = /^(true|yes|y|1|on|да)$/i, FALSE_WORDS = /^(false|no|n|0|off|нет|none)$/i;
 function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
 function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, d.getHours(), d.getMinutes(), d.getSeconds()); }
-function parseWhen(v, endOfDay) { // ISO dates plus the words small models like to send
+var ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+// ISO dates plus the words small models like to send. Returns a Date (with .dateOnly when no time was
+// given) or null. strict (writes): only ISO 8601 and the words below, never the engine's loose parsing.
+function parseWhen(v, endOfDay, strict) {
   if (v instanceof Date) return v;
   var s = lower(trim(v)), now = new Date(), m, day = null;
   if (s === 'now') return now;
@@ -141,12 +153,24 @@ function parseWhen(v, endOfDay) { // ISO dates plus the words small models like 
   else if ((m = /^([+-]\d+)\s*(d|days?)$/.exec(s))) day = startOfDay(addDays(now, parseInt(m[1], 10)));
   else if ((m = /^in\s+(\d+)\s*(d|days?|w|weeks?)$/.exec(s))) day = startOfDay(addDays(now, parseInt(m[1], 10) * (/^w/.test(m[2]) ? 7 : 1)));
   else if ((m = /^(\d+)\s*(d|days?|w|weeks?)\s+ago$/.exec(s))) day = startOfDay(addDays(now, -parseInt(m[1], 10) * (/^w/.test(m[2]) ? 7 : 1)));
-  else if ((m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) day = new Date(+m[1], +m[2] - 1, +m[3]); // date only = local day, not UTC midnight
-  if (day) return endOfDay ? new Date(day.getFullYear(), day.getMonth(), day.getDate(), 23, 59, 59) : day;
-  var d = new Date(v);
-  return isNaN(d.getTime()) ? null : d;
+  else if ((m = ISO_DATE.exec(trim(v)))) {
+    var y = +m[1], mo = +m[2] - 1, d = +m[3], probe = new Date(y, mo, d);
+    if (probe.getFullYear() !== y || probe.getMonth() !== mo || probe.getDate() !== d) return null; // 2026-02-30 is not a date
+    if (m[4] == null) day = probe; // date only = that local day, not UTC midnight
+    else {
+      if (+m[4] > 23 || +m[5] > 59 || +(m[6] || 0) > 59) return null;
+      var t = new Date(trim(v).replace(' ', 'T'));
+      return isNaN(t.getTime()) ? null : t;
+    }
+  } else if (strict) return null;
+  if (day) {
+    var out = endOfDay ? new Date(day.getFullYear(), day.getMonth(), day.getDate(), 23, 59, 59) : day;
+    out.dateOnly = true;
+    return out;
+  }
+  var loose = new Date(v);
+  return isNaN(loose.getTime()) ? null : loose;
 }
-function isDateOnly(v) { return typeof v === 'string' && /^(\d{4}-\d{2}-\d{2}|today|tomorrow|yesterday|[+-]\d+\s*d(ays?)?|in\s+\d+\s*(d|days?|w|weeks?)|\d+\s*(d|days?|w|weeks?)\s+ago)$/i.test(trim(v)); }
 
 function coerce(v, spec, key, strict) {
   var t = spec.type;
@@ -180,19 +204,24 @@ function coerce(v, spec, key, strict) {
     }
     case 'ids': {
       var items = Array.isArray(v) ? v : (typeof v === 'string' ? toList(v) : [v]);
+      if (!items.length) bad('a non-empty list of message ids');
       return items.map(function (x, i) { return coerce(x, { type: 'id' }, key + '[' + i + ']', strict); });
     }
-    case 'list':
-      return (Array.isArray(v) ? v.map(String) : toList(v)).map(trim).filter(Boolean);
+    case 'list': {
+      var names = (Array.isArray(v) ? v.map(String) : toList(v)).map(trim).filter(Boolean);
+      if (!names.length) bad('a non-empty list (leave it out instead)'); // an empty selector must not mean "all"
+      return names;
+    }
     case 'addresses': {
       var list = Array.isArray(v) ? v.map(String).map(trim).filter(Boolean) : toList(v);
+      if (!list.length) bad('at least one email address');
       var wrong = list.filter(function (x) { return !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(addrOf(x)); });
       if (wrong.length) fail('Not an email address: ' + wrong.join(', ') + ' (argument "' + key + '").', 'Give addresses like "anna@example.com" or "Anna <anna@example.com>", separated by commas.');
       return list;
     }
     case 'date': {
-      var d = typeof v === 'string' || v instanceof Date ? parseWhen(v, spec.endOfDay) : null;
-      if (!d) bad('a date: 2026-10-27, 2026-10-27T13:00:00-06:00, today, tomorrow, yesterday or "3 days ago"');
+      var d = typeof v === 'string' || v instanceof Date ? parseWhen(v, spec.endOfDay, strict) : null;
+      if (!d) bad('a real date: 2026-10-27, 2026-10-27T13:00:00-06:00, today, tomorrow, yesterday or "3 days ago"');
       return d;
     }
     case 'object':
@@ -203,7 +232,9 @@ function coerce(v, spec, key, strict) {
         v = parsed;
       }
       if (t === 'object') return normaliseArgs(v, spec.props, key, strict);
-      return (Array.isArray(v) ? v : [v]).map(function (x, i) { return normaliseArgs(x, spec.props, key + '[' + i + ']', strict); });
+      var objs = Array.isArray(v) ? v : [v];
+      if (!objs.length) bad('a non-empty list');
+      return objs.map(function (x, i) { return normaliseArgs(x, spec.props, key + '[' + i + ']', strict); });
   }
   return v;
 }
@@ -233,14 +264,15 @@ function normaliseArgs(raw, specs, path, strict) {
     if (strict) fail(msg + '.', 'Allowed here: ' + (allowed.join(', ') || 'none') + '.');
     note(msg + ' — ignored. Allowed here: ' + (allowed.join(', ') || 'none') + '.');
   }
-  var missing = Object.keys(specs).filter(function (k) { return specs[k].required && out[k] === undefined; });
+  var missing = Object.keys(specs).filter(function (k) { return specs[k].required && out[k] === undefined; })
+    .map(function (k) { return path === 'args' ? k : path + '.' + k; });
   if (missing.length) fail('Missing required argument' + (missing.length > 1 ? 's: ' : ': ') + missing.join(', ') + '.',
-    missing.map(function (k) { return k + ' — ' + (specs[k].desc || specs[k].type); }).join('; '));
+    missing.map(function (k) { var spec = specs[k.split('.').pop()]; return k + ' — ' + (spec.desc || spec.type); }).join('; '));
   Object.keys(specs).forEach(function (k) { if (out[k] === undefined && specs[k]['default'] !== undefined) out[k] = specs[k]['default']; });
   return out;
 }
 function stableJSON(v) {
-  if (v instanceof Date) return JSON.stringify(v.toISOString());
+  if (v instanceof Date) return JSON.stringify(v.toISOString() + (v.dateOnly ? '/day' : ''));
   if (Array.isArray(v)) return '[' + v.map(stableJSON).join(',') + ']';
   if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(function (k) { return JSON.stringify(k) + ':' + stableJSON(v[k]); }).join(',') + '}';
   return JSON.stringify(v);
@@ -417,10 +449,17 @@ function normSubject(s) {
   return lower(String(s || '').replace(/^\s*((re|fw|fwd|aw|wg|sv|tr|rv|ответ|отв|пересл|ha)\s*(\[\d+\])?\s*:\s*)+/i, '').replace(/\s+/g, ' ').trim());
 }
 function daysAgo(n) { return new Date(Date.now() - n * 864e5); }
-function sentBoxes(account) {
-  var list = allBoxes(account).filter(function (b) { return b.role === 'sent'; });
-  if (!list.length) note('No Sent folder found' + (account ? ' in ' + account : '') + ', so your own replies could not be checked.');
-  return list;
+// Messages I sent since cutoff: f(box, id, subject, date, recipients[]) for each.
+function eachSent(account, cutoff, f) {
+  var boxes = allBoxes(account).filter(function (b) { return b.role === 'sent'; });
+  if (!boxes.length) note('No Sent folder found' + (account ? ' in ' + account : '') + ', so your own replies could not be checked.');
+  boxes.forEach(function (b) {
+    checkCancelled();
+    var spec = b.ref.messages.whose({ dateSent: { _greaterThan: cutoff } }), ids = safe(function () { return spec.id(); }, []);
+    if (!ids.length) return;
+    var subs = spec.subject(), dates = spec.dateSent(), rcpt = recipientsOf(spec);
+    ids.forEach(function (id, i) { f(b, id, subs[i], dates[i], rcpt[i] || []); });
+  });
 }
 function ensureSent(ok, what) { if (ok === false) fail('Mail did not send the ' + what + ' (it reported a failure).', 'Check the account in Mail, then try once more.'); }
 function messageIds(a) {
@@ -428,15 +467,31 @@ function messageIds(a) {
   if (!ids.length) fail('Give "ids" (a list of message ids) or "id".', 'Ids come from list_messages or search_messages.');
   return ids.filter(function (x, i) { return ids.indexOf(x) === i; });
 }
-function eachMessage(a, f) { // f(found) per id; ids that are not found are reported, not fatal
+// f(found) per id → nothing (done), or a string (skipped: why). Lookup and Mail errors are reported per id,
+// with their real text; a cancellation stops the loop before the next message.
+function eachMessage(a, f, dryRun) {
   var ok = [], failed = [];
   messageIds(a).forEach(function (id) {
-    var found = safe(function () { return getMessage({ id: id, account: a.account, mailbox: a.mailbox }); }, null);
-    if (!found) { failed.push({ id: id, error: 'not found' }); return; }
-    try { var r = f(found); if (r) failed.push(r); else ok.push(id); } catch (e) { failed.push({ id: id, error: e instanceof UserError ? e.message : errorText(e) }); }
+    if (!dryRun) checkCancelled();
+    var found, why;
+    try { found = getMessage({ id: id, account: a.account, mailbox: a.mailbox }); } catch (e) {
+      if (e instanceof Cancelled) throw e;
+      failed.push({ id: id, error: errorText(e) }); return;
+    }
+    try { why = f(found); } catch (e) {
+      if (e instanceof Cancelled) throw e;
+      why = errorText(e);
+    }
+    if (why) failed.push({ id: id, error: why }); else ok.push(id);
   });
-  if (!ok.length && failed.length) fail('Nothing was changed: ' + failed.map(function (x) { return x.id + ' (' + x.error + ')'; }).join(', ') + '.', 'Ids come from list_messages or search_messages.');
+  if (!ok.length && failed.length) fail((dryRun ? 'None of these would ' + dryRun + ': ' : 'Nothing was changed: ') + failed.map(function (x) { return x.id + ' (' + x.error + ')'; }).join(', ') + '.',
+    'Ids come from list_messages or search_messages.');
   return { ok: ok, failed: failed };
+}
+function preview(a, verb, target) { // dry run: target(found) → {label} or {refused: why}
+  var plan = [];
+  var r = eachMessage(a, function (found) { var to = target(found); if (to.refused) return to.refused; plan.push(ext(summary(found), { to: to.label })); }, verb);
+  return { dry_run: true, would: verb, messages: plan, refused: r.failed };
 }
 function summary(found) {
   var m = found.ref;
@@ -444,6 +499,19 @@ function summary(found) {
 }
 // AppleScript string literal (create_rule builds an AppleScript)
 function q(v) { return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '\\n').replace(/\t/g, '\\t') + '"'; }
+// AppleScript reference for a resolved mailbox, nested ones as "mailbox "B" of mailbox "A" of account …"
+function mailboxRef(box) {
+  return box.path.split('/').reverse().map(function (p) { return 'mailbox ' + q(p); }).join(' of ') + ' of account ' + q(box.account);
+}
+// A rule that deletes runs on every account's new mail; it is only allowed where every account keeps deleted mail in its Trash.
+function assertRecoverableRuleDelete() {
+  var unsafe = mail().accounts().filter(function (acc) {
+    var n = acc.name();
+    return !safe(function () { return acc.moveDeletedMessagesToTrash(); }, false) || !roleBox('trash', n);
+  }).map(function (acc) { return acc.name(); });
+  if (unsafe.length) fail('A deleting rule would remove mail for good in: ' + unsafe.join(', ') + ' (no Trash, or deleted mail is not kept there).',
+    'Use a rule that moves mail to a folder instead (move_to).');
+}
 function getRule(name) {
   var names = safe(function () { return mail().rules.name(); }, []), exact = pickName(name, names);
   if (!exact) fail('No rule named "' + name + '".' + didYouMean(name, names), 'Rules: ' + (names.join(', ') || 'none') + '.');
@@ -508,18 +576,12 @@ var MAIL = {
   // Sent emails with no later message from any of the people they went to.
   awaiting_reply: function (a) {
     var cutoff = daysAgo(a.days), me = myAddresses(), mine = Object.create(null), bySubject = Object.create(null);
-    sentBoxes(a.account).forEach(function (b) {
-      checkCancelled();
-      var spec = b.ref.messages.whose({ dateSent: { _greaterThan: cutoff } }), ids = safe(function () { return spec.id(); }, []);
-      if (!ids.length) return;
-      var subs = spec.subject(), dates = spec.dateSent(), rcpt = recipientsOf(spec);
-      ids.forEach(function (id, i) {
-        var subj = normSubject(subs[i]), people = (rcpt[i] || []).filter(function (x) { return !me[x]; });
-        if (!subj || !people.length) return;
-        var key = subj + '\u0000' + people.slice().sort().join(',');
-        if (!mine[key] || dates[i] > mine[key].date) mine[key] = { id: id, box: b, subject: subs[i], date: dates[i], people: people };
-        (bySubject[subj] = bySubject[subj] || {})[key] = 1;
-      });
+    eachSent(a.account, cutoff, function (b, id, subject, date, rcpt) {
+      var subj = normSubject(subject), people = rcpt.filter(function (x) { return !me[x]; });
+      if (!subj || !people.length) return;
+      var key = subj + '\u0000' + people.slice().sort().join(',');
+      if (!mine[key] || date > mine[key].date) mine[key] = { id: id, box: b, subject: subject, date: date, people: people };
+      (bySubject[subj] = bySubject[subj] || {})[key] = 1;
     });
     allBoxes(a.account).forEach(function (b) {
       if (b.role === 'sent' || NOT_MAIL.indexOf(b.role) >= 0) return;
@@ -543,20 +605,14 @@ var MAIL = {
   // Inbox mail from people, not marked replied, and you have not written to that sender in that conversation since.
   needs_response: function (a) {
     var cutoff = daysAgo(a.days), me = myAddresses(), lastMine = Object.create(null);
-    sentBoxes(a.account).forEach(function (b) {
-      checkCancelled();
-      var spec = b.ref.messages.whose({ dateSent: { _greaterThan: cutoff } }), ids = safe(function () { return spec.id(); }, []);
-      if (!ids.length) return;
-      var subs = spec.subject(), dates = spec.dateSent(), rcpt = recipientsOf(spec);
-      ids.forEach(function (_, i) {
-        var subj = normSubject(subs[i]);
-        if (subj) (rcpt[i] || []).forEach(function (who) { var k = subj + '\u0000' + who; if (!lastMine[k] || dates[i] > lastMine[k]) lastMine[k] = dates[i]; });
-      });
+    eachSent(a.account, cutoff, function (b, id, subject, date, rcpt) {
+      var subj = normSubject(subject);
+      if (subj) rcpt.forEach(function (who) { var k = subj + '\u0000' + who; if (!lastMine[k] || date > lastMine[k]) lastMine[k] = date; });
     });
     var inbox = getMailbox(a.account, 'INBOX'), latest = Object.create(null);
     rowsOf(inbox.ref.messages.whose({ dateReceived: { _greaterThan: cutoff } }), inbox).forEach(function (r) {
       var who = addrOf(r.from);
-      if (me[who] || BOT_SENDER.test(who)) return;
+      if (!who || me[who] || BOT_SENDER.test(who)) return;
       var k = (normSubject(r.subject) || ('#' + r.id)) + '\u0000' + who;
       if (!latest[k] || r.date > latest[k].date) latest[k] = r;
     });
@@ -674,44 +730,33 @@ var MAIL = {
     var COLORS = { red: 0, orange: 1, yellow: 2, green: 3, blue: 4, purple: 5, gray: 6 };
     var r = eachMessage(a, function (found) {
       var m = found.ref;
-      if (a.flagged) { m.flaggedStatus = true; if (a.color) m.flagIndex = COLORS[a.color]; }
-      else { m.flaggedStatus = false; safe(function () { m.flagIndex = -1; }); }
+      if (!a.flagged) { m.flaggedStatus = false; safe(function () { m.flagIndex = -1; }); return; }
+      m.flaggedStatus = true;
+      if (a.color) { try { m.flagIndex = COLORS[a.color]; } catch (e) { note('Message ' + found.ref.id() + ' is flagged, but Mail did not take the color: ' + errorText(e)); } }
     });
     return { flagged: a.flagged, color: a.color, updated: r.ok.length, failed: r.failed };
   },
   move_messages: function (a) {
     var M = mail(), targets = {};
-    function target(account) { return targets[account] || (targets[account] = getMailbox(a.to_account || account, a.to_mailbox)); }
-    if (a.dry_run) {
-      var plan = [];
-      eachMessage(a, function (found) { plan.push(ext(summary(found), { to: boxLabel(target(found.box.account)) })); });
-      return { dry_run: true, would_move: plan };
+    function target(found) {
+      var acc = a.to_account || found.box.account, dst = targets[acc] || (targets[acc] = getMailbox(acc, a.to_mailbox));
+      return boxLabel(dst) === boxLabel(found.box) ? 'already in ' + boxLabel(dst) : dst;
     }
-    checkCancelled();
-    var r = eachMessage(a, function (found) {
-      var dst = target(found.box.account);
-      if (boxLabel(dst) === boxLabel(found.box)) return { id: found.ref.id(), error: 'already in ' + boxLabel(dst) };
-      M.move(found.ref, { to: dst.ref });
-    });
+    if (a.dry_run) return preview(a, 'move', function (found) { var t = target(found); return typeof t === 'string' ? { refused: t } : { label: boxLabel(t) }; });
+    var r = eachMessage(a, function (found) { var t = target(found); if (typeof t === 'string') return t; M.move(found.ref, { to: t.ref }); });
     return { moved: r.ok.length, to: Object.keys(targets).map(function (k) { return boxLabel(targets[k]); }), failed: r.failed };
   },
   // Moves into the account's own Trash folder (recoverable). Never deletes for good.
   delete_messages: function (a) {
     var M = mail(), trashes = {};
-    function trashOf(found) {
+    function trashOf(found) { // a mailbox, or why not
       var acc = found.box.account;
+      if (found.box.role === 'trash') return 'already in Trash; deleting there would be permanent';
       if (!(acc in trashes)) trashes[acc] = roleBox('trash', acc);
-      if (found.box.role === 'trash') throw new UserError('already in Trash; deleting there would be permanent');
-      if (!trashes[acc]) throw new UserError('account ' + acc + ' has no Trash folder, so deleting would be permanent');
-      return trashes[acc];
+      return trashes[acc] || 'account ' + acc + ' has no Trash folder, so deleting would be permanent';
     }
-    if (a.dry_run) {
-      var plan = [];
-      eachMessage(a, function (found) { plan.push(ext(summary(found), { to: boxLabel(trashOf(found)) })); });
-      return { dry_run: true, would_move_to_trash: plan };
-    }
-    checkCancelled();
-    var r = eachMessage(a, function (found) { M.move(found.ref, { to: trashOf(found).ref }); });
+    if (a.dry_run) return preview(a, 'go to Trash', function (found) { var t = trashOf(found); return typeof t === 'string' ? { refused: t } : { label: boxLabel(t) }; });
+    var r = eachMessage(a, function (found) { var t = trashOf(found); if (typeof t === 'string') return t; M.move(found.ref, { to: t.ref }); });
     if (r.failed.length) note('Not deleted: ' + r.failed.map(function (x) { return x.id + ' (' + x.error + ')'; }).join(', ') + '. The user can delete those in Mail.');
     return { moved_to_trash: r.ok.length, failed: r.failed };
   },
@@ -724,7 +769,8 @@ var MAIL = {
     }
     var all = m.mailAttachments(), names = all.map(function (x) { return x.name(); }), saved = [], failed = [];
     if (!all.length) fail('This message has no attachments.');
-    var want = a.names && a.names.length ? a.names : null;
+    var want = a.names || null;
+    if (want && want.length > 1 && names.indexOf(want.join(', ')) >= 0) want = [want.join(', ')]; // one file name that contains a comma
     if (want) {
       var missing = want.filter(function (w) { return names.indexOf(w) < 0; });
       if (missing.length === want.length) fail('No attachments named ' + missing.join(', ') + '.', 'Attachments: ' + names.join(', ') + '.');
@@ -733,14 +779,16 @@ var MAIL = {
     $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
     all.forEach(function (x, i) {
       if (want && want.indexOf(names[i]) < 0) return;
-      try { var p = uniquePath(dir, names[i]); M.save(x, { 'in': Path(p) }); saved.push(p); } catch (e) { failed.push(names[i] + ': ' + errorText(e)); }
+      checkCancelled();
+      try { var p = uniquePath(dir, names[i]); M.save(x, { 'in': Path(p) }); saved.push(p); } catch (e) { if (e instanceof Cancelled) throw e; failed.push(names[i] + ': ' + errorText(e)); }
     });
     return { saved: saved, failed: failed };
   },
   // "Parent/Child" creates each missing level under its parent.
   create_mailbox: function (a) {
     var M = mail(), acc = getAccount(a.account), accName = acc.name(), parts = a.name.split('/').map(trim).filter(Boolean), parent = null, path = '', created = [];
-    if (!parts.length) fail('Give the folder name.');
+    if (!parts.length) fail('"' + a.name + '" has no folder name in it.', 'Give a name like "Receipts", or "Parent/Child" for a subfolder.');
+    if (parts.join('/') !== a.name) note('Folder path read as "' + parts.join('/') + '".');
     parts.forEach(function (part) {
       path = path ? path + '/' + part : part;
       var list = parent ? parent.mailboxes : acc.mailboxes, existing = list.byName(part);
@@ -759,10 +807,10 @@ var MAIL = {
     var OP = { contains: 'does contain value', not_contains: 'does not contain value', begins: 'begins with value', ends: 'ends with value', equals: 'equal to value' };
     if (safe(function () { mail().rules.byName(a.name).name(); return true; }, false)) fail('A rule named "' + a.name + '" already exists.', 'Pick another name, or delete_rule first.');
     var move = a.move_to ? getMailbox(a.move_to.account, a.move_to.mailbox) : null;
-    if (move && move.unified) fail('move_to needs an account and a mailbox, e.g. {"account": "iCloud", "mailbox": "Receipts"}.');
+    if (a['delete']) assertRecoverableRuleDelete();
     if (!move && !a.mark_read && !a.flag && !a['delete']) note('The rule has no action (move_to, mark_read, flag, delete).');
     var props = ['name:' + q(a.name), 'enabled:false', 'all conditions must be met:' + (a.match === 'all')];
-    if (move) props.push('should move message:true', 'move message:(mailbox ' + q(move.path) + ' of account ' + q(move.account) + ')');
+    if (move) props.push('should move message:true', 'move message:(' + mailboxRef(move) + ')');
     if (a.mark_read) props.push('mark read:true');
     if (a.flag) props.push('mark flagged:true');
     if (a['delete']) props.push('delete message:true');
@@ -777,14 +825,26 @@ var MAIL = {
     lines.push('end tell');
     var app = Application.currentApplication();
     app.includeStandardAdditions = true;
+    checkCancelled();
     try { app.runScript(lines.join('\n'), { 'in': 'AppleScript' }); } catch (e) {
-      safe(function () { var r = mail().rules.byName(a.name); r.name(); mail()['delete'](r); }); // never leave a half-built rule behind
+      try { var r = mail().rules.byName(a.name); r.name(); mail()['delete'](r); } catch (e2) {} // never leave a half-built rule behind
       fail('Mail could not create the rule: ' + errorText(e) + '. Nothing was left behind.');
     }
     return MAIL.list_rules().filter(function (x) { return x.name === a.name; })[0];
   },
-  set_rule_enabled: function (a) { var r = getRule(a.name); r.enabled = a.enabled; return { rule: r.name(), enabled: a.enabled }; },
-  delete_rule: function (a) { var r = getRule(a.name), n = r.name(); mail()['delete'](r); return { deleted_rule: n }; }
+  set_rule_enabled: function (a) {
+    var r = getRule(a.name);
+    if (a.enabled && safe(function () { return r.deleteMessage(); }, true)) assertRecoverableRuleDelete();
+    r.enabled = a.enabled;
+    return { rule: r.name(), enabled: a.enabled };
+  },
+  // Mail keeps no copy of a deleted rule, so the result carries the whole rule for create_rule.
+  delete_rule: function (a) {
+    var r = getRule(a.name), n = r.name(), copy = MAIL.list_rules().filter(function (x) { return x.name === n; })[0];
+    mail()['delete'](r);
+    note('Rules cannot be restored in Mail. The deleted rule is in "copy"; tell the user, and recreate it with create_rule if asked.');
+    return { deleted_rule: n, copy: copy };
+  }
 };
 
 // ======================================================================
@@ -835,6 +895,9 @@ function parseRule(rule) {
   }
   if (r.BYMONTH) out.bymonth = r.BYMONTH.split(',').map(function (x) { return parseInt(x, 10) - 1; });
   if (r.BYMONTHDAY) out.bymd = r.BYMONTHDAY.split(',').map(function (x) { return parseInt(x, 10); });
+  if (out.bymd && out.byday) return null; // both at once (e.g. "Friday the 13th") is not expanded here
+  if (r.WKST && r.WKST !== 'MO' && out.freq === 'WEEKLY' && out.interval > 1) return null; // week boundaries assume Monday
+  if (out.freq === 'WEEKLY' && out.byday && out.byday.some(function (b) { return b.n; })) return null; // ordinals only make sense monthly/yearly
   return out;
 }
 function expandRecurrence(rule, start, end, excluded, from, to) {
@@ -892,18 +955,20 @@ function expandRecurrence(rule, start, end, excluded, from, to) {
 // re-run for every property. So: three bulk reads per calendar (start, end, rule), cached while the
 // event count stays the same, and the remaining fields only for the events that fall in the window.
 var EVENT_CACHE = {}, EVENT_CACHE_MS = 10 * 60e3;
-function eventTimes(c) {
+function eventTimes(c, fresh) { // bulk start/end/rule/uid of one calendar, by index
   var key = c.index + '\u0000' + c.name, count = safe(function () { return c.ref.events.length; }, -1), hit = EVENT_CACHE[key];
-  if (hit && hit.count === count && Date.now() - hit.at < EVENT_CACHE_MS) return hit;
-  hit = { count: count, at: Date.now(), start: safe(function () { return c.ref.events.startDate(); }, []),
-    end: safe(function () { return c.ref.events.endDate(); }, []), rule: safe(function () { return c.ref.events.recurrence(); }, []) };
+  if (!fresh && hit && hit.count === count && Date.now() - hit.at < EVENT_CACHE_MS) return hit;
+  function bulk(f) { return safe(function () { return c.ref.events[f](); }, []); }
+  hit = { count: count, at: Date.now(), start: bulk('startDate'), end: bulk('endDate'), rule: bulk('recurrence'), uid: bulk('uid') };
   return (EVENT_CACHE[key] = hit);
 }
-function eventsIn(c, from, to) { // occurrences in [from, to) of one calendar, repeating events expanded
-  var t = eventTimes(c), out = [];
-  t.start.forEach(function (start, i) {
-    var end = t.end[i], rule = t.rule[i] || '';
-    if (!start || start >= to) return;
+// Occurrences in [from, to) of one calendar, repeating events expanded. Cached rows are read by index, so each
+// detail read checks that the index still holds the same uid; if not, the calendar is read again, once.
+function eventsIn(c, from, to, retried) {
+  var t = eventTimes(c, retried), out = [], moved = false;
+  for (var i = 0; i < t.start.length && !moved; i++) {
+    var start = t.start[i], end = t.end[i], rule = t.rule[i] || '';
+    if (!start || start >= to) continue;
     var occ;
     if (!rule) occ = end > from ? [{ start: start, end: end }] : [];
     else {
@@ -913,13 +978,18 @@ function eventsIn(c, from, to) { // occurrences in [from, to) of one calendar, r
         if (ex && ex.length) occ = expandRecurrence(rule, start, end, ex, from, to);
       }
     }
-    if (occ && !occ.length) return;
-    var ev = c.ref.events[i], base = { title: safe(function () { return ev.summary(); }, ''), uid: safe(function () { return ev.uid(); }, null),
-      location: safe(function () { return ev.location(); }, null) || null, all_day: !!safe(function () { return ev.alldayEvent(); }, false), recurring: !!rule,
-      calendar: c.name, calendar_index: c.index };
-    if (occ === null) { if (end > from) out.push(ext(base, { start: start, end: end, recurrence: rule, note: 'repeats by a rule this server cannot expand; check Calendar for the dates' })); return; }
+    if (occ && !occ.length) continue;
+    var ev = c.ref.events[i];
+    if (safe(function () { return ev.uid(); }, null) !== t.uid[i]) { moved = true; break; }
+    var base = { title: safe(function () { return ev.summary(); }, ''), uid: t.uid[i], location: safe(function () { return ev.location(); }, null) || null,
+      all_day: !!safe(function () { return ev.alldayEvent(); }, false), recurring: !!rule, calendar: c.name, calendar_index: c.index };
+    if (occ === null) { // a rule this server cannot expand: the series may well be in the window, so say so
+      out.push(ext(base, { start: start, end: end, recurrence: rule, note: 'repeats by a rule this server cannot expand (series start shown); check Calendar for the dates in this range' }));
+      continue;
+    }
     occ.forEach(function (o) { out.push(ext(base, { start: o.start, end: o.end })); });
-  });
+  }
+  if (moved) { if (retried) fail('Calendar "' + c.name + '" kept changing while it was read.', 'Try again in a moment.'); return eventsIn(c, from, to, true); }
   return out;
 }
 
@@ -945,14 +1015,19 @@ var CALENDAR = {
     if (!target) {
       if (writable.length !== 1) fail('Which calendar? ' + (writable.length ? 'Writable calendars: ' + writable.map(function (c) { return c.name + ' (index ' + c.index + ')'; }).join(', ') + '.' : 'No writable calendar found.'), 'Pass calendar (a name) or calendar_index.');
       target = writable[0];
+      note('Using calendar "' + target.name + '", the only writable one.');
     }
     if (!target.writable) fail('Calendar "' + target.name + '" is read-only.', 'Writable: ' + writable.map(function (c) { return c.name; }).join(', ') + '.');
-    var allDay = a.all_day != null ? a.all_day : isDateOnly(a.start_raw);
-    var start = allDay ? startOfDay(a.start) : a.start, end = a.end;
+    var allDay = a.all_day != null ? a.all_day : !!a.start.dateOnly, start = a.start, end = a.end;
+    if (allDay && !start.dateOnly) note('all_day: the time in "start" was dropped.');
+    if (allDay) start = startOfDay(start);
     if (!end) { end = allDay ? addDays(start, 1) : new Date(start.getTime() + 3600e3); note('No "end" given: ' + (allDay ? 'one all-day event.' : 'one hour long.')); }
-    else if (allDay && isDateOnly(a.end_raw)) end = addDays(startOfDay(end), 1); // a date-only end day is included
+    else if (end.dateOnly) {
+      if (!allDay) fail('"end" is a date without a time, but "start" has a time.', 'Give "end" a time, e.g. ' + iso(new Date(start.getTime() + 3600e3)) + ', or make it all_day:true.');
+      end = addDays(startOfDay(end), 1); // a date-only end day is included
+    }
     if (end <= start) fail('"end" (' + iso(end) + ') must be after "start" (' + iso(start) + ').');
-    if (end - start > 366 * 864e5) fail('The event would last more than a year; check "start" and "end".');
+    if (end - start > 366 * 864e5) fail('Events can be at most one year long here; this one runs ' + iso(start) + ' → ' + iso(end) + '.', 'Check "start" and "end".');
     var props = { summary: a.title, startDate: start, endDate: end, alldayEvent: allDay };
     if (a.location) props.location = a.location;
     if (a.notes) props.description = a.notes;
@@ -965,18 +1040,25 @@ var CALENDAR = {
     var list = calendarList(), one = pickCalendar(a, list), hits = [];
     (one ? [one] : list).forEach(function (c) {
       safe(function () { return c.ref.events.whose({ uid: a.uid })(); }, []).forEach(function (ev) {
-        hits.push({ ref: ev, calendar: c, title: safe(function () { return ev.summary(); }, ''), start: safe(function () { return ev.startDate(); }, null), recurrence: safe(function () { return ev.recurrence(); }, '') });
+        var rule; // a failed read must not pass as "does not repeat"
+        try { rule = ev.recurrence() || ''; } catch (e) { if (e instanceof Cancelled) throw e; rule = null; }
+        hits.push({ ref: ev, calendar: c, recurrence: rule, copy: {
+          title: safe(function () { return ev.summary(); }, ''), start: iso(safe(function () { return ev.startDate(); }, null)), end: iso(safe(function () { return ev.endDate(); }, null)),
+          all_day: safe(function () { return ev.alldayEvent(); }, null), location: safe(function () { return ev.location(); }, null) || null,
+          notes: safe(function () { return ev.description(); }, null) || null, recurrence: rule || null } });
       });
     });
     if (!hits.length) fail('No event with uid ' + a.uid + (one ? ' in "' + one.name + '"' : '') + '.', 'Uids come from list_events.');
     if (hits.length > 1) fail('This uid is in ' + hits.length + ' calendars: ' + hits.map(function (h) { return h.calendar.name + ' (index ' + h.calendar.index + ')'; }).join(', ') + '. Nothing was deleted.', 'Pass calendar_index to delete one copy.');
     var h = hits[0];
     if (!h.calendar.writable) fail('Calendar "' + h.calendar.name + '" is read-only; the event cannot be deleted here.');
-    if (h.recurrence && !a.whole_series) fail('"' + h.title + '" repeats; deleting it removes every occurrence. Nothing was deleted.', 'Only if the user wants the whole series gone, call again with whole_series:true. Single occurrences cannot be deleted here.');
+    if (h.recurrence === null) fail('Could not tell whether "' + h.copy.title + '" repeats, so nothing was deleted.', 'Try again; if it keeps failing, the user can delete it in Calendar.');
+    if (h.recurrence && !a.whole_series) fail('"' + h.copy.title + '" repeats; deleting it removes every occurrence. Nothing was deleted.', 'Only if the user wants the whole series gone, call again with whole_series:true. Single occurrences cannot be deleted here.');
     checkCancelled();
     cal()['delete'](h.ref);
     EVENT_CACHE = {};
-    return { deleted: h.title, calendar: h.calendar.name, start: iso(h.start), whole_series: !!h.recurrence };
+    note('Calendar has no trash for events. The deleted event is in "copy"; recreate it with create_event if the user asks.');
+    return { deleted: h.copy.title, calendar: h.calendar.name, whole_series: !!h.recurrence, copy: h.copy };
   }
 };
 
@@ -1056,6 +1138,8 @@ var NOTES_APP = {
   update_note: function (a) {
     var n = getNote(a.id);
     if (safe(function () { return n.passwordProtected(); }, false)) fail('The note is locked.', 'The user must unlock it in Notes first.');
+    var files = safe(function () { return n.attachments.length; }, 0);
+    if (!a.append && files) fail('The note has ' + files + ' attachment(s) (images, files, drawings); replacing its body would drop them. Nothing was changed.', 'Use append:true to add text, or let the user edit the note in Notes.');
     var add = toNoteHtml(a.body, a.html);
     if (a.append) n.body = n.body() + add;
     else n.body = '<div><h1>' + esc(a.title || n.name()) + '</h1></div>' + add;
@@ -1064,10 +1148,12 @@ var NOTES_APP = {
   // Only where Notes keeps a Recently Deleted folder (iCloud, On My Mac); elsewhere deleting is permanent.
   delete_note: function (a) {
     var n = getNote(a.id), title = n.name(), folder = n.container();
+    if (safe(function () { return n.passwordProtected(); }, false)) fail('"' + title + '" is locked.', 'The user must unlock it in Notes first, or delete it there.');
     if (DELETED_FOLDER.test(safe(function () { return folder.name(); }, ''))) fail('"' + title + '" is already in Recently Deleted; deleting it there is permanent, so this tool will not do it.');
+    // Recently Deleted exists only in upgraded accounts (iCloud, On My Mac); a folder with that name elsewhere proves nothing.
     var account = safe(function () { return folder.container(); }, null), accName = safe(function () { return account.name(); }, '?');
-    if (!safe(function () { return account.folders.name().some(function (f) { return DELETED_FOLDER.test(f); }); }, false))
-      fail('Notes account "' + accName + '" has no Recently Deleted folder, so deleting would be permanent. Nothing was deleted.', 'The user can delete it in Notes.');
+    var recoverable = safe(function () { return account.upgraded(); }, false) && safe(function () { return account.folders.name().some(function (f) { return DELETED_FOLDER.test(f); }); }, false);
+    if (!recoverable) fail('Notes account "' + accName + '" keeps no Recently Deleted, so deleting would be permanent. Nothing was deleted.', 'The user can delete it in Notes.');
     checkCancelled();
     notes()['delete'](n);
     return { deleted: title, recoverable: 'in Recently Deleted for about 30 days' };
@@ -1096,7 +1182,7 @@ var ACTIONS = {
   search_messages: { tool: 'read', desc: 'Search mail by text and filters. Searches the inbox unless mailbox is given or all_mailboxes:true.',
     args: { query: { type: 'string', desc: 'text to find' }, 'in': { type: 'string', values: ['subject_sender', 'subject', 'sender', 'body', 'any'], 'default': 'subject_sender', desc: 'where to look for query; body is slower' },
       from: { type: 'string', desc: 'sender contains' }, subject: { type: 'string', desc: 'subject contains' },
-      account: MSG.account, mailbox: { type: 'string' }, all_mailboxes: { type: 'boolean', 'default': false, desc: 'every folder except Trash/Junk' },
+      account: MSG.account, mailbox: { type: 'string' }, all_mailboxes: { type: 'boolean', 'default': false, desc: 'every folder except Trash, Junk, Drafts and Outbox' },
       from_date: { type: 'date', desc: 'e.g. 2026-10-01 or "7 days ago"' }, to_date: { type: 'date', endOfDay: true },
       unread: { type: 'boolean' }, flagged: { type: 'boolean' }, has_attachments: { type: 'boolean' }, limit: LIMIT(20) }, run: MAIL.search_messages },
   awaiting_reply: { tool: 'read', desc: 'Emails you sent that nobody you wrote to has answered. Check this before saying "they never replied".',
@@ -1136,21 +1222,21 @@ var ACTIONS = {
         op: { type: 'string', values: ['contains', 'not_contains', 'begins', 'ends', 'equals'], 'default': 'contains', aliases: ['operator', 'qualifier', 'type', 'match'],
           valueAliases: { is: 'equals', equal: 'equals', '=': 'equals', '==': 'equals', starts_with: 'begins', begins_with: 'begins', ends_with: 'ends', does_not_contain: 'not_contains', doesnt_contain: 'not_contains', excludes: 'not_contains', includes: 'contains', has: 'contains' } },
         value: { type: 'string', required: true, aliases: ['expression', 'text', 'pattern', 'contains'] } } },
-      move_to: { type: 'object', desc: '{account, mailbox}', props: { account: { type: 'string' }, mailbox: { type: 'string', required: true } },
+      move_to: { type: 'object', desc: '{account, mailbox}', props: { account: { type: 'string', required: true }, mailbox: { type: 'string', required: true } },
         fromString: function (s) { var p = s.split('/'); return p.length > 1 && pickName(p[0], accountNames()) ? { account: p[0], mailbox: p.slice(1).join('/') } : { mailbox: s }; } },
       mark_read: { type: 'boolean' }, flag: { type: 'boolean' }, 'delete': { type: 'boolean' }, stop: { type: 'boolean' }, enabled: { type: 'boolean', 'default': true } }, run: MAIL.create_rule },
   set_rule_enabled: { tool: 'write', desc: 'Turn a rule on (enabled:true) or off (enabled:false).', args: { name: { type: 'string', required: true, aliases: ['rule'] }, enabled: { type: 'boolean', required: true } }, run: MAIL.set_rule_enabled },
-  delete_rule: { tool: 'write', guard: true, desc: 'Delete a rule by name.', args: { name: { type: 'string', required: true, aliases: ['rule'] } }, run: MAIL.delete_rule },
+  delete_rule: { tool: 'write', guard: true, desc: 'Delete a rule by name. Permanent in Mail; the result holds a copy of the rule.', args: { name: { type: 'string', required: true, aliases: ['rule'] } }, run: MAIL.delete_rule },
   // ---- Calendar
   list_calendars: { tool: 'read', desc: 'Calendars with index (use it when two share a name) and whether they are writable.', args: {}, run: CALENDAR.list_calendars },
   list_events: { tool: 'read', desc: 'Events from "from" to "to", repeating events included. No calendar = all calendars.',
     args: { from: { type: 'date', desc: 'default today', aliases: ['start', 'date', 'day', 'on'] }, to: { type: 'date', endOfDay: true, desc: 'default 7 days after from', aliases: ['end'] },
       calendar: { type: 'string' }, calendar_index: { type: 'integer', min: 0 }, limit: LIMIT(100, 500) }, run: CALENDAR.list_events },
-  create_event: { tool: 'write', guard: true, keepRaw: ['start', 'end'], desc: 'Create an event. start/end: ISO 8601 with time zone, e.g. 2026-10-27T13:00:00-06:00. A date alone makes an all-day event.',
+  create_event: { tool: 'write', guard: true, desc: 'Create an event. start/end: ISO 8601 with time zone, e.g. 2026-10-27T13:00:00-06:00. A date alone makes an all-day event.',
     args: { title: { type: 'string', required: true }, start: { type: 'date', required: true, aliases: ['from', 'date', 'when', 'start_date', 'on'] }, end: { type: 'date', desc: 'default: 1 hour after start', aliases: ['to', 'end_date', 'until'] },
       all_day: { type: 'boolean' }, calendar: { type: 'string', desc: 'needed when several calendars are writable' }, calendar_index: { type: 'integer', min: 0 },
       location: { type: 'string' }, notes: { type: 'string' } }, run: CALENDAR.create_event },
-  delete_event: { tool: 'write', guard: true, desc: 'Delete an event by uid (from list_events). A repeating event needs whole_series:true.',
+  delete_event: { tool: 'write', guard: true, desc: 'Delete an event by uid (from list_events). Permanent in Calendar; the result holds a copy. A repeating event needs whole_series:true.',
     args: { uid: { type: 'string', required: true, aliases: ['id'] }, calendar: { type: 'string' }, calendar_index: { type: 'integer', min: 0 }, whole_series: { type: 'boolean', 'default': false } }, run: CALENDAR.delete_event },
   // ---- Notes
   list_note_folders: { tool: 'read', desc: 'Notes accounts and folders with note counts.', args: {}, run: NOTES_APP.list_note_folders },
@@ -1179,7 +1265,7 @@ var ACTION_ALIASES = {
   no_reply: 'awaiting_reply', waiting: 'awaiting_reply', waiting_for_reply: 'awaiting_reply',
   calendars: 'list_calendars', events: 'list_events', agenda: 'list_events', get_events: 'list_events', schedule_list: 'list_events',
   notes: 'list_notes', note_folders: 'list_note_folders', find_notes: 'search_notes', get_note: 'read_note', open_note: 'read_note',
-  send: 'send_email', send_mail: 'send_email', compose: 'send_email', new_email: 'send_email', email: 'send_email', send_message: 'send_email', write_email: 'send_email',
+  send: 'send_email', send_mail: 'send_email', compose: 'send_email', draft: 'send_email', draft_email: 'send_email', new_email: 'send_email', email: 'send_email', send_message: 'send_email', write_email: 'send_email',
   reply: 'reply_message', respond: 'reply_message', answer: 'reply_message', reply_email: 'reply_message', reply_to_message: 'reply_message',
   forward: 'forward_message', forward_email: 'forward_message', mark_read: 'set_read', mark_unread: 'set_read', mark_as_read: 'set_read', mark_as_unread: 'set_read',
   flag: 'set_flag', flag_message: 'set_flag', unflag: 'set_flag', move: 'move_messages', move_message: 'move_messages',
@@ -1190,6 +1276,7 @@ var ACTION_ALIASES = {
   new_note: 'create_note', add_note: 'create_note', edit_note: 'update_note', append_note: 'update_note', remove_note: 'delete_note'
 };
 var ALIAS_PRESETS = { // what an alias implies, unless the args say otherwise
+  compose: { draft: true }, new_email: { draft: true }, write_email: { draft: true }, draft: { draft: true }, draft_email: { draft: true },
   mark_read: { read: true }, mark_as_read: { read: true }, mark_unread: { read: false }, mark_as_unread: { read: false },
   unflag: { flagged: false }, enable_rule: { enabled: true }, disable_rule: { enabled: false }, append_note: { append: true }
 };
@@ -1234,11 +1321,16 @@ function splitInput(input) { // {action, args} from whatever shape the model sen
   }
   if (!args || typeof args !== 'object' || Array.isArray(args)) fail('"args" must be an object like {"id": 123}.');
   args = ext(args, {});
+  if (input.action !== undefined && args.action !== undefined && stableJSON(input.action) !== stableJSON(args.action))
+    fail('Two different actions: "' + input.action + '" and args.action "' + args.action + '". Give one.');
   var action = input.action !== undefined ? input.action : args.action !== undefined ? args.action : input.name;
   delete args.action;
   var flat = Object.keys(input).filter(function (k) { return k !== 'action' && k !== argKey && !(k === 'name' && input.action === undefined); });
   if (flat.length) {
-    flat.forEach(function (k) { if (args[k] === undefined) args[k] = input[k]; });
+    flat.forEach(function (k) {
+      if (args[k] !== undefined && stableJSON(args[k]) !== stableJSON(input[k])) fail('"' + k + '" is given twice with different values (next to "action" and inside "args"). Give it once, inside "args".');
+      args[k] = input[k];
+    });
     note('Arguments belong inside "args": {"action": "…", "args": {…}}.');
   }
   return { action: action, args: args };
@@ -1255,10 +1347,7 @@ function callPublic(tool, input) {
   if (found.presets) Object.keys(found.presets).forEach(function (k) { if (args[k] === undefined) args[k] = found.presets[k]; });
   var repeat = args.repeat !== undefined && TRUE_WORDS.test(String(args.repeat));
   delete args.repeat;
-  var raw = {};
-  (spec.keepRaw || []).forEach(function (k) { raw[k] = args[k]; });
   var a = normaliseArgs(args, spec.args, 'args', spec.tool === 'write');
-  (spec.keepRaw || []).forEach(function (k) { a[k + '_raw'] = raw[k]; });
 
   var key = found.name + ' ' + stableJSON(a), now = Date.now();
   if (spec.guard && !a.dry_run) {
@@ -1271,6 +1360,7 @@ function callPublic(tool, input) {
     if (LAST_READ.key === key && now - LAST_READ.at < 60e3) note('You just made this same call. Use that result instead of calling again.');
     LAST_READ = { key: key, at: now };
   }
+  if (spec.tool === 'write') checkCancelled(); // last chance before anything changes
   var result = spec.run(a);
   if (spec.guard && !a.dry_run) DONE.push({ key: key, at: now });
   return result;
@@ -1335,6 +1425,11 @@ function handle(req) {
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
     if (method === 'tools/call') {
+      var names = PUBLIC_TOOLS.map(function (t) { return t.name; });
+      if (typeof p.name !== 'string' || names.indexOf(p.name) < 0)
+        return send({ jsonrpc: '2.0', id: id, error: { code: -32602, message: 'Unknown tool: ' + p.name + '. Tools: ' + names.join(', ') + (READ_ONLY ? ' (read-only mode is on)' : '') } });
+      if (p.arguments !== undefined && (p.arguments === null || typeof p.arguments !== 'object' || Array.isArray(p.arguments)))
+        return send({ jsonrpc: '2.0', id: id, error: { code: -32602, message: 'tools/call arguments must be an object: {"action": "…", "args": {…}}' } });
       var out;
       try {
         out = { content: [{ type: 'text', text: formatResult(callPublic(p.name, p.arguments)) }] };

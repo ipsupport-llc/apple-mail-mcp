@@ -109,7 +109,8 @@ Claude asks before using each tool. We recommend **Allow for all tasks** on `rea
 
 ## Safety
 
-- **Deleting is never permanent.** Mail goes to the account's Trash, notes go to Recently Deleted. Where that isn't possible — an account without a Trash folder, a Notes account without Recently Deleted (e.g. Exchange), something already in the trash — the extension refuses and says why.
+- **Mail and notes are never deleted for good.** Mail goes to the account's Trash, notes go to Recently Deleted. Where that isn't possible — an account without a Trash folder, a Notes account without Recently Deleted (e.g. Exchange), something already in the trash, a locked note — the extension refuses and says why. Mail rules that delete are only allowed when every account keeps deleted mail in its Trash.
+- **Calendar events and rules have no trash in macOS.** Deleting one returns a full copy of it, so it can be recreated on request.
 - **Replies and forwards are drafts by default.** Mail fills in their recipients and quote, so you see the real thing in Mail and press *Send* yourself.
 - **No accidental repeats.** The same send, reply, delete or create call twice within 15 minutes is refused — a stuck model can't send an email five times.
 - **Repeating events are deleted only on purpose.** Deleting one removes the whole series, so the extension asks for `whole_series: true`.
@@ -176,8 +177,8 @@ Two tools, each taking `{ "action": "...", "args": { ... } }`. The full list of 
 | `delete_messages` | Move to the account's Trash (`dry_run` available) |
 | `save_attachments` | Save attachments into the attachments folder |
 | `create_mailbox` | New folder |
-| `create_rule` · `set_rule_enabled` · `delete_rule` | Mail rules |
-| `create_event` · `delete_event` | Calendar events (`whole_series: true` to delete a repeating one) |
+| `create_rule` · `set_rule_enabled` · `delete_rule` | Mail rules (a deleted rule comes back as a copy) |
+| `create_event` · `delete_event` | Calendar events (`whole_series: true` to delete a repeating one; a deleted event comes back as a copy) |
 | `create_note` · `update_note` · `delete_note` | Notes |
 
 Message ids come from list and search results; pass `account` and `mailbox` from the same row. If the folder is wrong, the message is found by its id anyway.
@@ -198,7 +199,7 @@ cd ~/code/apple-mail-mcp
 ./uninstall.sh   # removes the entry
 ```
 
-`install.sh` takes the same settings as the extension: `--read-only`, `--account Work`, `--save-dir ~/Documents/Attachments`.
+`install.sh` takes the same settings as the extension: `--read-only` / `--no-read-only`, `--account Work`, `--save-dir ~/Documents/Attachments`. Running it again keeps earlier settings unless you change them (`--reset` forgets them).
 
 Restart Claude after `install.sh`. Don't use the manual install and the `.mcpb` at the same time.
 

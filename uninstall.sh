@@ -12,7 +12,10 @@ ObjC.import('Foundation');
 var path = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('CFG'));
 var cfg = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)));
 var had = !!(cfg.mcpServers && cfg.mcpServers['apple-mail']);
-if (had) { delete cfg.mcpServers['apple-mail']; $(JSON.stringify(cfg, null, 2) + '\n').writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null); }
+if (had) {
+  delete cfg.mcpServers['apple-mail'];
+  if (!$(JSON.stringify(cfg, null, 2) + '\n').writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null)) throw new Error('Could not write ' + path);
+}
 had ? 'removed' : 'absent';
 JS
 )

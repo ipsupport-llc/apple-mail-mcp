@@ -99,9 +99,7 @@ function makeMail() {
     return r;
   }
   M.inbox = role([['iCloud', 'INBOX'], ['Work', 'INBOX']]);
-  var unified = coll([]);
-  M.inbox.messages = { byId: function (id) { return allMessages().filter(function (m) { return m.id() === id && m._box.name() === 'INBOX'; })[0] || missing(id); },
-    whose: function (c) { return coll(allMessages().filter(function (m) { return m._box.name() === 'INBOX' && matches(m, c); })); } };
+  Object.defineProperty(M.inbox, 'messages', { get: function () { return coll(allMessages().filter(function (m) { return m._box.name() === 'INBOX'; })); } });
   M.sentMailbox = role([['iCloud', 'Sent Messages'], ['Work', 'Sent Items']]);
   M.trashMailbox = role([['iCloud', 'Deleted Messages']]);
   M.junkMailbox = role([['iCloud', 'Junk']]);
@@ -122,7 +120,11 @@ function makeMail() {
       Object.defineProperty(o, f, { value: fn });
     });
     o.send = function () { M.sent.push(o); return M.sendResult; };
-    o.mailAttachments = function () { return props.attachments || []; };
+    var files = props.attachments || [];
+    o.mailAttachments = function () { return files; };
+    var content = props.content || '';
+    Object.defineProperty(o, 'content', { get: function () { return function () { return content; }; },
+      set: function (v) { content = v; if (M.editDropsAttachments) files = []; } });
     o.close = function () { o.closed = true; };
     return o;
   }
@@ -130,11 +132,11 @@ function makeMail() {
   M.outgoingMessages = { push: function () {} };
   M.ToRecipient = M.CcRecipient = M.BccRecipient = function (p) { return item({ name: p.name || '', address: p.address }); };
   M.reply = function (m, opts) { var o = outgoing({ subject: 'Re: ' + m.subject() }); o.toRecipients.push(recipient(lower(m.sender()).replace(/.*<|>.*/g, ''))); o.opts = opts; return o; };
-  M.forward = function (m, opts) { var o = outgoing({ subject: 'Fwd: ' + m.subject(), content: '', attachments: M.forwardKeepsAttachments ? m.mailAttachments() : [] }); o.opts = opts; return o; };
-  M.forwardKeepsAttachments = true;
+  M.forward = function (m, opts) { var o = outgoing({ subject: 'Fwd: ' + m.subject(), content: '', attachments: m.mailAttachments() }); o.opts = opts; return o; };
+  M.editDropsAttachments = false;
   M.activate = function () {};
   M.Mailbox = function (p) { return item(p); };
-  M.rules = coll([]);
+  M.rules = coll([], { onPush: function (x, items) { items.push(item(x._props)); } });
   M.save = function (x, opts) { M.saved = (M.saved || []).concat(String(opts['in'])); };
   M.icloud = icloud; M.work = work;
   return M;
@@ -150,7 +152,7 @@ function makeCalendar() {
   }
   function event(p) {
     return item({ summary: p.summary, startDate: p.startDate, endDate: p.endDate, location: p.location || '', uid: p.uid || ('uid-' + nextId++),
-      alldayEvent: !!p.alldayEvent, recurrence: p.recurrence || '', excludedDates: p.excludedDates || [], description: p.description || '' });
+      alldayEvent: !!p.alldayEvent, recurrence: p.recurrence instanceof Error ? p.recurrence : (p.recurrence || ''), excludedDates: p.excludedDates || [], description: p.description || '' });
   }
   var home = calendar('Home', true), work1 = calendar('Work', true), work2 = calendar('Work', true), holidays = calendar('Holidays', false);
   C.calendars = coll([home, work1, work2, holidays]);
@@ -175,11 +177,12 @@ function makeNotes() {
     var title = (/<h1>(.*?)<\/h1>/.exec(body) || [])[1] || 'Untitled';
     var n = item({ id: 'x-coredata://N/ICNote/p' + (nextId++), name: title, body: body, plaintext: body.replace(/<[^>]+>/g, ' '), modificationDate: new Date(), creationDate: new Date(), passwordProtected: false });
     n.container = function () { return f; };
+    n.attachments = coll([]);
     all.push(n);
     return n;
   }
-  function account(name, folders) {
-    var a = item({ name: name });
+  function account(name, folders, upgraded) {
+    var a = item({ name: name, upgraded: upgraded });
     a.folders = coll([]);
     folders.forEach(function (fn) { a.folders.items.push(folder(a, fn)); });
     a.folders.push = function () {};
@@ -187,7 +190,7 @@ function makeNotes() {
     a.notes = { whose: function (c) { return coll(all.filter(function (n) { return n.container().container() === a && matches(n, c); })); } };
     return a;
   }
-  var icloud = account('iCloud', ['Notes', 'Recently Deleted', 'Archive']), exchange = account('Exchange', ['Notes']);
+  var icloud = account('iCloud', ['Notes', 'Recently Deleted', 'Archive'], true), exchange = account('Exchange', ['Notes', 'Recently Deleted'], false); // a user folder named like the trash
   [icloud, exchange].forEach(function (a) { a.folders.items.forEach(function (f, i) { a.folders[i] = f; }); Object.defineProperty(a.folders, 'length', { value: a.folders.items.length }); });
   N.accounts = coll([icloud, exchange]);
   N.notes = { byId: function (id) { return all.filter(function (n) { return n.id() === id; })[0] || missing(id); },
@@ -344,11 +347,13 @@ function run(argv) {
     var r = call('write', { action: 'reply_message', args: { id: m.id(), account: 'iCloud', body: 'ok' } });
     eq(Mail.sent.length, 0); eq(r.to, ['anna@example.com']); has(r.status, 'draft');
   });
-  test('forward that loses attachments is not sent', function () {
-    Mail.forwardKeepsAttachments = false;
+  test('forward keeps attachments without a note; one that loses them on edit is not sent', function () {
+    var plain = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf'] });
+    eq(call('write', { action: 'forward_message', args: { id: plain.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }).attachments, 1);
+    Mail.editDropsAttachments = true;
     var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf'] });
     has(callErr('write', { action: 'forward_message', args: { id: m.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }), 'dropped the attachments');
-    eq(Mail.sent.length, 0);
+    eq(Mail.sent.length, 1, 'only the first forward went out');
   });
   test('save_attachments stays inside the attachments folder', function () {
     var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf'] });
@@ -390,7 +395,7 @@ function run(argv) {
     var r = call('write', { action: 'create_event', args: { title: 'Trip', start: '2026-10-27', calendar: 'Home' } });
     eq(r.all_day, true);
     has(callErr('write', { action: 'create_event', args: { title: 'x', start: '2026-10-27T10:00:00Z', end: '2026-10-27T09:00:00Z', calendar: 'Home' } }), 'must be after');
-    has(callErr('write', { action: 'create_event', args: { title: 'x', start: 'next tuesday-ish', calendar: 'Home' } }), 'must be a date');
+    has(callErr('write', { action: 'create_event', args: { title: 'x', start: 'next tuesday-ish', calendar: 'Home' } }), 'must be a real date');
   });
   test('create_event without calendar when several are writable', function () {
     has(callErr('write', { action: 'create_event', args: { title: 'x', start: '2026-10-27T10:00:00Z' } }), 'Which calendar?');
@@ -436,7 +441,7 @@ function run(argv) {
   });
   test('delete_note refuses where it would be permanent', function () {
     var n = NotesApp.addNote(NotesApp.exchange.folders.byName('Notes'), 'Work note');
-    has(callErr('write', { action: 'delete_note', args: { id: n.id() } }), 'no Recently Deleted folder');
+    has(callErr('write', { action: 'delete_note', args: { id: n.id() } }), 'keeps no Recently Deleted');
     var m = NotesApp.addNote(NotesApp.icloud.folders.byName('Notes'), 'Personal');
     eq(call('write', { action: 'delete_note', args: { id: m.id() } }).deleted, 'Personal');
   });
@@ -445,6 +450,119 @@ function run(argv) {
     NotesApp.addNote(NotesApp.exchange.folders.byName('Notes'), 'Work');
     // the fake has no per-account notes collection for listing; search_notes covers the account filter
     eq(call('read', { action: 'search_notes', args: { query: 'Work', account: 'Exchange' } }).items.map(function (x) { return x.title; }), ['Work']);
+  });
+
+  // ---- second review round
+  test('a value given flat and inside args with different values is an error', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({});
+    has(callErr('write', { action: 'send_email', draft: true, args: { to: 'b@example.com', subject: 's', body: 'b', draft: false } }), 'given twice');
+    has(callErr('read', { action: 'read_message', id: 2, args: { id: m.id() } }), 'given twice');
+    has(callErr('read', { action: 'list_messages', args: { action: 'list_rules' } }), 'Two different actions');
+  });
+  test('compose opens a draft, send sends', function () {
+    eq(call('write', { action: 'compose', args: { to: 'b@example.com', subject: 's', body: 'b' } }).status.indexOf('Draft') === 0, true);
+    eq(Mail.sent.length, 0);
+    call('write', { action: 'send', args: { to: 'b@example.com', subject: 's2', body: 'b' } });
+    eq(Mail.sent.length, 1);
+  });
+  test('a display name with a comma stays one address', function () {
+    var r = call('write', { action: 'send_email', args: { to: '"Doe, John" <john@example.com>, ann@example.com', subject: 's', body: 'b', draft: true } });
+    eq(r.to.length, 2);
+  });
+  test('empty lists are errors, never "all"', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['secret.pdf'] });
+    has(callErr('write', { action: 'save_attachments', args: { id: m.id(), names: [] } }), 'non-empty list');
+    has(callErr('write', { action: 'create_rule', args: { name: 'r', conditions: [], move_to: { account: 'iCloud', mailbox: 'Receipts' } } }), 'non-empty list');
+    has(callErr('write', { action: 'set_read', args: { ids: [], read: true } }), 'non-empty list');
+  });
+  test('an attachment name with a comma is found', function () {
+    var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['Report, final.pdf', 'x.png'] });
+    eq(call('write', { action: 'save_attachments', args: { id: m.id(), names: 'Report, final.pdf' } }).saved.length, 1);
+  });
+  test('dry runs list what would be refused', function () {
+    var ok1 = Mail.box('iCloud', 'INBOX').add({}), noTrash = Mail.box('Work', 'INBOX').add({});
+    var r = call('write', { action: 'delete_messages', args: { ids: [ok1.id(), noTrash.id(), 999999], dry_run: true } });
+    eq(r.messages.length, 1); eq(r.refused.length, 2);
+    has(JSON.stringify(r.refused), 'no Trash folder');
+  });
+  test('a cancelled write stops before changing anything', function () {
+    var a = Mail.box('iCloud', 'INBOX').add({ read: false });
+    CURRENT = { key: 'number:1' }; CANCELLED['number:1'] = true;
+    try {
+      var threw = false;
+      try { callPublic('write', { action: 'set_read', args: { ids: [a.id()], read: true } }); } catch (e) { threw = e instanceof Cancelled; }
+      ok(threw, 'expected Cancelled'); eq(a.readStatus(), false);
+    } finally { CURRENT = null; delete CANCELLED['number:1']; }
+  });
+  test('safe() does not swallow a cancellation', function () {
+    var threw = false;
+    try { safe(function () { throw new Cancelled(); }, 1); } catch (e) { threw = e instanceof Cancelled; }
+    ok(threw);
+  });
+  test('rules: deleting actions only where every account keeps a Trash; move_to needs account; nested folder reference', function () {
+    has(callErr('write', { action: 'create_rule', args: { name: 'r', conditions: [{ field: 'from', value: 'x' }], 'delete': true } }), 'remove mail for good in: Work');
+    has(callErr('write', { action: 'create_rule', args: { name: 'r', conditions: [{ field: 'from', value: 'x' }], move_to: { mailbox: 'Receipts' } } }), 'move_to.account');
+    eq(mailboxRef({ path: 'A/B', account: 'X' }), 'mailbox "B" of mailbox "A" of account "X"');
+    Mail.rules.items.push(item({ name: 'Purge', enabled: false, deleteMessage: true }));
+    has(callErr('write', { action: 'set_rule_enabled', args: { name: 'Purge', enabled: true } }), 'remove mail for good');
+  });
+  test('needs_response skips messages without a sender', function () {
+    Mail.box('iCloud', 'INBOX').add({ from: ' ', date: new Date(Date.now() - 864e5) });
+    eq(call('read', { action: 'needs_response', args: { account: 'iCloud' } }).count, 0);
+  });
+  test('dates: alias "date" is all-day like "start"; impossible and loose dates fail on writes', function () {
+    eq(call('write', { action: 'create_event', args: { title: 'A', date: '2026-10-27', calendar: 'Home' } }).all_day, true);
+    has(callErr('write', { action: 'create_event', args: { title: 'B', start: '2026-02-30', calendar: 'Home' } }), 'real date');
+    has(callErr('write', { action: 'create_event', args: { title: 'C', start: 'Oct 27 2026', calendar: 'Home' } }), 'real date');
+    ok(parseWhen('Oct 27 2026') !== null, 'reads stay lenient');
+  });
+  test('create_event: timed start with a date-only end is an error; all_day drops the time with a note; one writable calendar is named', function () {
+    has(callErr('write', { action: 'create_event', args: { title: 'x', start: '2026-10-27T10:00:00', end: '2026-10-27', calendar: 'Home' } }), 'date without a time');
+    has(call('write', { action: 'create_event', args: { title: 'y', start: '2026-10-27T13:00:00', all_day: true, calendar: 'Home' } }).notes.join(' '), 'time in "start" was dropped');
+    Cal.work1._props.writable = false; Cal.work2._props.writable = false;
+    has(call('write', { action: 'create_event', args: { title: 'z', start: '2026-10-28T10:00:00' } }).notes.join(' '), 'Using calendar "Home"');
+  });
+  test('delete_event: unreadable recurrence refuses; result keeps a copy', function () {
+    Cal.addEvent(Cal.home, { summary: 'Odd', startDate: new Date(), endDate: new Date(), uid: 'odd', recurrence: new Error('AppleEvent timed out') });
+    has(callErr('write', { action: 'delete_event', args: { uid: 'odd' } }), 'Could not tell whether');
+    Cal.addEvent(Cal.home, { summary: 'Dentist', startDate: new Date(2026, 9, 30, 9), endDate: new Date(2026, 9, 30, 10), uid: 'd1', location: 'Main St' });
+    var r = call('write', { action: 'delete_event', args: { uid: 'd1' } });
+    eq(r.copy.title, 'Dentist'); eq(r.copy.location, 'Main St');
+  });
+  test('delete_rule returns a copy of the rule', function () {
+    Mail.rules.items.push(item({ name: 'Old', enabled: true, allConditionsMustBeMet: true, ruleConditions: [], shouldMoveMessage: false, markRead: true, deleteMessage: false, stopEvaluatingRules: false }));
+    var r = call('write', { action: 'delete_rule', args: { name: 'old' } });
+    eq(r.copy.name, 'Old'); eq(r.copy.mark_read, true);
+  });
+  test('list_events: cached rows re-read when events move', function () {
+    Cal.addEvent(Cal.home, { summary: 'First', startDate: new Date(2026, 9, 14, 10), endDate: new Date(2026, 9, 14, 11), uid: 'f' });
+    Cal.addEvent(Cal.home, { summary: 'Second', startDate: new Date(2026, 9, 21, 10), endDate: new Date(2026, 9, 21, 11), uid: 's' });
+    var args = { from: '2026-10-12', to: '2026-10-25', calendar_index: 0 };
+    call('read', { action: 'list_events', args: args });
+    var items = Cal.home.events.items; items.reverse(); items.forEach(function (x, i) { Cal.home.events[i] = x; }); // same count, new order
+    LAST_READ = { key: null, at: 0 };
+    var r = call('read', { action: 'list_events', args: args }).items;
+    eq(r.map(function (x) { return x.title + ':' + x.uid; }), ['First:f', 'Second:s']);
+  });
+  test('RRULE: BYMONTHDAY with BYDAY is not expanded; such a series still shows up later with a note', function () {
+    ok(expandRecurrence('FREQ=MONTHLY;BYMONTHDAY=13;BYDAY=FR', new Date(), new Date(), [], new Date(), new Date()) === null);
+    Cal.addEvent(Cal.home, { summary: 'Payday', startDate: new Date(2024, 0, 31, 9), endDate: new Date(2024, 0, 31, 10), uid: 'p', recurrence: 'FREQ=MONTHLY;BYSETPOS=-1;BYDAY=MO,TU,WE,TH,FR' });
+    var r = call('read', { action: 'list_events', args: { from: '2026-10-01', to: '2026-10-31', calendar_index: 0 } });
+    eq(r.items.length, 1); has(r.items[0].note, 'cannot expand');
+  });
+  test('notes: a folder named Recently Deleted in a non-upgraded account is not a trash; locked notes and attachments are protected', function () {
+    var n = NotesApp.addNote(NotesApp.exchange.folders.byName('Notes'), 'Work note');
+    has(callErr('write', { action: 'delete_note', args: { id: n.id() } }), 'keeps no Recently Deleted');
+    var locked = NotesApp.addNote(NotesApp.icloud.folders.byName('Notes'), 'Secret'); locked._props.passwordProtected = true;
+    has(callErr('write', { action: 'delete_note', args: { id: locked.id() } }), 'locked');
+    var pic = NotesApp.addNote(NotesApp.icloud.folders.byName('Notes'), 'Photo'); pic.attachments.items.push(item({ name: 'img.png' })); pic.attachments.push;
+    Object.defineProperty(pic.attachments, 'length', { value: 1 });
+    has(callErr('write', { action: 'update_note', args: { id: pic.id(), body: 'new text' } }), 'would drop them');
+    eq(call('write', { action: 'update_note', args: { id: pic.id(), body: 'more', append: true } }).appended, true);
+  });
+  test('list_messages without an account reads all inboxes', function () {
+    Mail.box('iCloud', 'INBOX').add({ subject: 'one' }); Mail.box('Work', 'INBOX').add({ subject: 'two' });
+    eq(call('read', { action: 'list_messages', args: {} }).items.map(function (x) { return x.account; }).sort(), ['Work', 'iCloud']);
   });
 
   // ---- registry sanity

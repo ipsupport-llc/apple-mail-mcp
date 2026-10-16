@@ -89,7 +89,17 @@ out, _ = run([INIT, {"jsonrpc": "2.0", "id": 11, "method": "tools/list"},
               {"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {"name": "write", "arguments": {"action": "send_email", "args": {}}}}],
              env={"APPLE_MAIL_READ_ONLY": "true"})
 check("read-only hides write", [t["name"] for t in by_id(out, 11)[0]["result"]["tools"]] == ["read"])
-check("read-only refuses write", "Read-only" in by_id(out, 12)[0]["result"]["content"][0]["text"])
+check("read-only: write is an unknown tool", by_id(out, 12)[0].get("error", {}).get("code") == -32602 and "read-only" in by_id(out, 12)[0]["error"]["message"])
+
+# bad tools/call shapes are protocol errors (-32602); action mistakes are isError results
+out, _ = run([INIT, {"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "nope", "arguments": {}}},
+              {"jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {"arguments": {}}},
+              {"jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {"name": "read", "arguments": [1]}},
+              {"jsonrpc": "2.0", "id": 16, "method": "tools/call", "params": {"name": "read", "arguments": {"action": "fly"}}}])
+check("unknown tool -32602", by_id(out, 13)[0].get("error", {}).get("code") == -32602)
+check("missing tool name -32602", by_id(out, 14)[0].get("error", {}).get("code") == -32602)
+check("non-object arguments -32602", by_id(out, 15)[0].get("error", {}).get("code") == -32602)
+check("unknown action is an isError result", by_id(out, 16)[0]["result"].get("isError"))
 
 # stdin from a regular file (not a pipe) also ends cleanly
 path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "apple-mail-mcp-proto.jsonl")
@@ -103,6 +113,48 @@ with open(path) as f:
     except subprocess.TimeoutExpired:
         check("exits when stdin is a file", False, "timed out")
 os.remove(path)
+
+# install.sh / uninstall.sh against a throwaway HOME
+import shutil
+import tempfile
+home = tempfile.mkdtemp()
+cfg = os.path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+
+
+def sh(*args):
+    return subprocess.run([os.path.join(ROOT, args[0])] + list(args[1:]), capture_output=True, text=True, env=dict(os.environ, HOME=home), timeout=60)
+
+
+def entry():
+    with open(cfg) as f:
+        return json.load(f)["mcpServers"]["apple-mail"]
+
+
+os.makedirs(os.path.dirname(cfg))
+with open(cfg, "w") as f:
+    f.write("{}")  # plutil once read this as an OpenStep plist and wrote nothing
+r = sh("install.sh", "--read-only", "--account", 'My "Work"')
+check("install on a fresh {} config", r.returncode == 0 and entry()["env"] == {"APPLE_MAIL_READ_ONLY": "true", "APPLE_MAIL_DEFAULT_ACCOUNT": 'My "Work"'}, r.stdout + r.stderr)
+sh("install.sh")
+check("reinstall keeps settings", entry()["env"].get("APPLE_MAIL_READ_ONLY") == "true")
+sh("install.sh", "--no-read-only", "--account", "")
+check("--no-read-only and --account '' clear them", entry()["env"] == {})
+with open(cfg, "w") as f:
+    json.dump({"other": 1, "mcpServers": {"x": {"command": "y"}}}, f)
+sh("install.sh", "--save-dir", "/tmp/a b")
+with open(cfg) as f:
+    c = json.load(f)
+check("other servers and keys are kept", c["other"] == 1 and "x" in c["mcpServers"] and c["mcpServers"]["apple-mail"]["env"] == {"APPLE_MAIL_SAVE_DIR": "/tmp/a b"})
+r = sh("uninstall.sh")
+with open(cfg) as f:
+    c = json.load(f)
+check("uninstall removes only apple-mail", "apple-mail" not in c["mcpServers"] and "x" in c["mcpServers"], r.stdout)
+with open(cfg, "w") as f:
+    f.write("not json")
+r = sh("install.sh")
+with open(cfg) as f:
+    check("invalid config is refused and left alone", r.returncode != 0 and f.read() == "not json")
+shutil.rmtree(home)
 
 if failures:
     print("FAILED:\n  " + "\n  ".join(failures))
