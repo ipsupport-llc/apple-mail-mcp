@@ -45,7 +45,7 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | --- | --- |
 | `list_accounts` | Mail accounts and their addresses |
 | `list_mailboxes` | Folders of an account with unread counts |
-| `list_messages` | Latest messages in a folder (default: unified Inbox), optional `unread_only` |
+| `list_messages` | Latest messages in a folder (default: unified Inbox), optional `unread_only`; each has `replied` / `forwarded` / `flagged` |
 | `search_messages` | Substring search in subject and sender |
 | `read_message` | Full message: headers, recipients, attachment names, plain-text body |
 | `list_rules` | Mail rules with their conditions and actions |

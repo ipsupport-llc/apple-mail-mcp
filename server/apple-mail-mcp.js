@@ -48,6 +48,8 @@ function summarize(spec, limit, unreadOnly) {
   var ids = spec.id();
   if (!ids.length) return [];
   var dates = spec.dateReceived(), subs = spec.subject(), senders = spec.sender(), read = spec.readStatus();
+  function bulk(f) { try { return spec[f](); } catch (e) { return []; } }
+  var replied = bulk('wasRepliedTo'), forwarded = bulk('wasForwarded'), flagged = bulk('flaggedStatus');
   var idx = [];
   for (var i = 0; i < ids.length; i++) if (!unreadOnly || !read[i]) idx.push(i);
   idx.sort(function (x, y) { return (dates[y] || 0) - (dates[x] || 0); });
@@ -55,7 +57,8 @@ function summarize(spec, limit, unreadOnly) {
   return idx.map(function (i) {
     var acc = null, mbx = null;
     try { var mb = spec[i].mailbox(); mbx = mb.name(); acc = mb.account().name(); } catch (e) {}
-    return { id: ids[i], account: acc, mailbox: mbx, date: iso(dates[i]), from: senders[i], subject: subs[i], read: read[i] };
+    return { id: ids[i], account: acc, mailbox: mbx, date: iso(dates[i]), from: senders[i], subject: subs[i], read: read[i],
+      replied: !!replied[i], forwarded: !!forwarded[i], flagged: !!flagged[i] };
   });
 }
 
@@ -75,7 +78,7 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: {} } },
   { name: 'list_mailboxes', description: 'Список папок (ящиков) аккаунта с числом непрочитанных.',
     inputSchema: { type: 'object', properties: { account: { type: 'string' } }, required: ['account'] } },
-  { name: 'list_messages', description: 'Последние письма в папке. Без account/mailbox — общий «Входящие».',
+  { name: 'list_messages', description: 'Последние письма в папке. Без account/mailbox — общий «Входящие». Каждое письмо с флагами replied/forwarded/flagged — проверяйте replied, прежде чем считать письмо неотвеченным.',
     inputSchema: { type: 'object', properties: {
       account: { type: 'string' }, mailbox: { type: 'string', description: 'по умолчанию INBOX' },
       limit: { type: 'number', description: 'по умолчанию 20' }, unread_only: { type: 'boolean' } } } },
@@ -174,6 +177,9 @@ var HANDLERS = {
       id: m.id(), account: a.account, mailbox: a.mailbox, date: iso(m.dateReceived()),
       from: m.sender(), to: recips(m.toRecipients()), cc: recips(m.ccRecipients()),
       reply_to: m.replyTo(), subject: m.subject(), read: m.readStatus(),
+      replied: (function () { try { return m.wasRepliedTo(); } catch (e) { return null; } })(),
+      forwarded: (function () { try { return m.wasForwarded(); } catch (e) { return null; } })(),
+      flagged: (function () { try { return m.flaggedStatus(); } catch (e) { return null; } })(),
       attachments: (function () { try { return m.mailAttachments().map(function (x) { return x.name(); }); } catch (e) { return []; } })(),
       body: clip(m.content(), 60000)
     };
@@ -347,7 +353,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.1.0' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.1.1' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
