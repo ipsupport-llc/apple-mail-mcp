@@ -108,6 +108,27 @@ var TOOLS = [
       calendar: { type: 'string', description: 'имя календаря; по умолчанию первый доступный для записи' },
       title: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' },
       location: { type: 'string' }, notes: { type: 'string' } }, required: ['title', 'start', 'end'] } },
+  { name: 'list_rules', description: 'Mail rules with conditions and actions.',
+    inputSchema: { type: 'object', properties: {} } },
+  { name: 'create_mailbox', description: 'Create a folder in an account. Nested: "Alerts/Kubernetes".',
+    inputSchema: { type: 'object', properties: { account: { type: 'string' }, name: { type: 'string' } }, required: ['account', 'name'] } },
+  { name: 'move_messages', description: 'Move messages (ids from one folder) to another folder.',
+    inputSchema: { type: 'object', properties: {
+      ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
+      to_mailbox: { type: 'string' }, to_account: { type: 'string', description: 'default: same account' } },
+      required: ['ids', 'account', 'mailbox', 'to_mailbox'] } },
+  { name: 'create_rule', description: 'Create a Mail rule. conditions: [{field: from|to|cc|subject|any_recipient|content, op: contains|not_contains|begins|ends|equals, value}]. Actions: move_to {account, mailbox}, mark_read, flag, delete, stop. Created disabled first, enabled after conditions are set.',
+    inputSchema: { type: 'object', properties: {
+      name: { type: 'string' }, match: { type: 'string', enum: ['all', 'any'], description: 'default all' },
+      conditions: { type: 'array', items: { type: 'object', properties: {
+        field: { type: 'string' }, op: { type: 'string' }, value: { type: 'string' } }, required: ['field', 'value'] } },
+      move_to: { type: 'object', properties: { account: { type: 'string' }, mailbox: { type: 'string' } } },
+      mark_read: { type: 'boolean' }, flag: { type: 'boolean' }, delete: { type: 'boolean' }, stop: { type: 'boolean' },
+      enabled: { type: 'boolean', description: 'default true' } }, required: ['name', 'conditions'] } },
+  { name: 'set_rule_enabled', description: 'Enable or disable a rule by name.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, enabled: { type: 'boolean' } }, required: ['name', 'enabled'] } },
+  { name: 'delete_rule', description: 'Delete a rule by name.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'delete_event', description: 'Удалить событие календаря по uid (uid из list_events).',
     inputSchema: { type: 'object', properties: { uid: { type: 'string' }, calendar: { type: 'string' } }, required: ['uid'] } },
   { name: 'delete_messages', description: 'Переместить письма в Корзину (не безвозвратно). ids — список id из одной папки.',
@@ -214,6 +235,56 @@ var HANDLERS = {
     target.events.push(ev);
     return 'Событие создано в календаре «' + target.name() + '»: ' + a.title + ', ' + a.start;
   },
+  list_rules: function () {
+    return mail().rules().map(function (r) {
+      var mv = null; try { if (r.shouldMoveMessage()) { var mb = r.moveMessage(); mv = mb.account().name() + ' / ' + mb.name(); } } catch (e) {}
+      return { name: r.name(), enabled: r.enabled(), match: r.allConditionsMustBeMet() ? 'all' : 'any',
+        conditions: r.ruleConditions().map(function (c) { return { type: c.ruleType(), qualifier: c.qualifier(), value: c.expression() }; }),
+        move_to: mv, mark_read: r.markRead(), delete: r.deleteMessage(), stop: r.stopEvaluatingRules() };
+    });
+  },
+  create_mailbox: function (a) {
+    var M = mail(), acc = getAccount(a.account);
+    acc.mailboxes.push(M.Mailbox({ name: a.name }));
+    acc.mailboxes.byName(a.name).name();
+    return 'Folder created: ' + a.account + ' / ' + a.name;
+  },
+  move_messages: function (a) {
+    var M = mail(), src = getMailbox(a.account, a.mailbox), dst = getMailbox(a.to_account || a.account, a.to_mailbox), ok = 0, failed = [];
+    (a.ids || []).forEach(function (id) {
+      try { M.move(src.messages.byId(Number(id)), { to: dst }); ok++; } catch (e) { failed.push(id); }
+    });
+    return { moved: ok, failed: failed, to: (a.to_account || a.account) + ' / ' + a.to_mailbox };
+  },
+  create_rule: function (a) {
+    var M = mail();
+    var FIELD = { from: 'from header', to: 'to header', cc: 'cc header', subject: 'subject header', any_recipient: 'any recipient', content: 'message content' };
+    var OP = { contains: 'does contain value', not_contains: 'does not contain value', begins: 'begins with value', ends: 'ends with value', equals: 'equal to value' };
+    if (!a.conditions || !a.conditions.length) throw new Error('At least one condition is required');
+    a.conditions.forEach(function (c) {
+      if (!FIELD[c.field]) throw new Error('Unknown field "' + c.field + '". Use: ' + Object.keys(FIELD).join(', '));
+      if (c.op && !OP[c.op]) throw new Error('Unknown op "' + c.op + '". Use: ' + Object.keys(OP).join(', '));
+    });
+    var dst = a.move_to ? getMailbox(a.move_to.account, a.move_to.mailbox) : null;
+    M.rules.push(M.Rule({ name: a.name, enabled: false }));
+    var r = M.rules.byName(a.name);
+    // a fresh rule may come with a default condition — remove it so nothing broad slips through
+    r.ruleConditions().forEach(function (c) { M.delete(c); });
+    a.conditions.forEach(function (c) {
+      r.ruleConditions.push(M.RuleCondition({ ruleType: FIELD[c.field], qualifier: OP[c.op || 'contains'], expression: c.value }));
+    });
+    r.allConditionsMustBeMet = (a.match || 'all') === 'all';
+    if (dst) { r.moveMessage = dst; r.shouldMoveMessage = true; }
+    if (a.mark_read) r.markRead = true;
+    if (a.flag) r.markFlagged = true;
+    if (a.delete) r.deleteMessage = true;
+    if (a.stop) r.stopEvaluatingRules = true;
+    if (r.ruleConditions().length !== a.conditions.length) { M.delete(r); throw new Error('Could not set rule conditions; rule removed'); }
+    r.enabled = a.enabled !== false;
+    return HANDLERS.list_rules().filter(function (x) { return x.name === a.name; })[0];
+  },
+  set_rule_enabled: function (a) { var r = mail().rules.byName(a.name); r.name(); r.enabled = !!a.enabled; return 'ok'; },
+  delete_rule: function (a) { var M = mail(), r = M.rules.byName(a.name); r.name(); M.delete(r); return 'Rule deleted: ' + a.name; },
   delete_event: function (a) {
     var C = cal(), cals = a.calendar ? [C.calendars.byName(a.calendar)] : C.calendars(), n = 0;
     cals.forEach(function (c) {
@@ -233,8 +304,9 @@ var HANDLERS = {
 };
 
 // ---------- two public tools: read / write ----------
-var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'list_calendars', 'list_events'];
-var WRITE_ACTIONS = ['send_email', 'reply_message', 'set_read', 'delete_messages', 'create_event', 'delete_event'];
+var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'list_rules', 'list_calendars', 'list_events'];
+var WRITE_ACTIONS = ['send_email', 'reply_message', 'set_read', 'delete_messages', 'create_mailbox', 'move_messages',
+  'create_rule', 'set_rule_enabled', 'delete_rule', 'create_event', 'delete_event'];
 
 function describe(actions) {
   return actions.map(function (n) {
@@ -275,7 +347,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.0.0' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.1.0' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });

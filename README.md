@@ -21,7 +21,7 @@ That's it: no Terminal, no config files. Updates and removal live in **Claude â†
 <summary>Manual install (without the .mcpb)</summary>
 
 ```sh
-git clone https://github.com/ipsupport-llc/apple-mail-mcp.git ~/code/apple-mail-mcp
+git clone https://github.com/OWNER/apple-mail-mcp.git ~/code/apple-mail-mcp
 cd ~/code/apple-mail-mcp
 ./install.sh      # adds an "apple-mail" entry to claude_desktop_config.json (with a backup)
 ```
@@ -48,6 +48,7 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | `list_messages` | Latest messages in a folder (default: unified Inbox), optional `unread_only` |
 | `search_messages` | Substring search in subject and sender |
 | `read_message` | Full message: headers, recipients, attachment names, plain-text body |
+| `list_rules` | Mail rules with their conditions and actions |
 | `list_calendars` | Calendars and whether they are writable |
 | `list_events` | Events in a date range, with `uid` |
 
@@ -59,10 +60,19 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | `reply_message` | Reply / reply-all; `draft: true` opens it instead of sending |
 | `set_read` | Mark read / unread |
 | `delete_messages` | Move messages to Trash (recoverable) |
+| `create_mailbox` | New folder, nested with `/` (e.g. `Alerts/Kubernetes`) |
+| `move_messages` | Move messages to another folder |
+| `create_rule` | New rule: conditions on from/to/cc/subject/content, actions move / mark read / flag / delete / stop |
+| `set_rule_enabled` | Turn a rule on or off |
+| `delete_rule` | Delete a rule |
 | `create_event` | New calendar event (ISO 8601 times with offset) |
 | `delete_event` | Delete an event by `uid` |
 
 Message ids come from `list_messages` / `search_messages` and are scoped to `account` + `mailbox`.
+
+## Notes on rules
+
+Apple Mail rules run only while Mail is open on the Mac, and only on new mail. To sort existing mail, search and use `move_messages`. If your mail server supports Sieve, server-side filters are more reliable across devices.
 
 ## Releasing
 
