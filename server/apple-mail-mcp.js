@@ -634,7 +634,7 @@ var MAIL = {
   list_messages: function (a) {
     var rows = [];
     inboxesOf(getMailbox(a.account, a.mailbox)).forEach(function (b) { rows = rows.concat(newestRows(b, a.unread ? [{ readStatus: false }] : [], a.limit)); });
-    return rows.sort(newestFirst).slice(0, a.limit).map(rowOut);
+    return dedupe(rows).sort(newestFirst).slice(0, a.limit).map(rowOut);
   },
   search_messages: function (a) {
     var conds = [];
@@ -729,12 +729,12 @@ var MAIL = {
       if (r.replied || (lastMine[k] && lastMine[k] > r.date)) return false;
       if (lastToPerson[who] && lastToPerson[who] > r.date) { elsewhere++; return false; }
       return true;
-    }).map(function (k) {
+    }).sort(function (x, y) { return latest[x].date - latest[y].date; }).slice(0, a.limit).map(function (k) { // oldest first; details only for what is shown
       var r = latest[k], o = rowOut(r), before = lastMine[k];
       o.waiting_days = Math.floor((Date.now() - r.date) / 864e5);
       o.situation = isInvitation(r) ? 'meeting invitation' : before ? 'they wrote again after your reply of ' + iso(before).slice(0, 10) : 'you have not replied';
       return o;
-    }).sort(function (x, y) { return y.waiting_days - x.waiting_days; }).slice(0, a.limit);
+    });
     if (elsewhere) note(elsewhere + ' more left out: you wrote to those senders after their message, in another conversation.');
     if (out.some(function (o) { return /wrote again/.test(o.situation); })) note('"they wrote again" means you answered earlier in that conversation; their last message may not need a reply — read it before saying so.');
     return out;
