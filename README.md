@@ -164,8 +164,8 @@ Two tools, each taking `{ "action": "...", "args": { ... } }`.
 | Action | Purpose |
 | --- | --- |
 | `send_email` | New email (or draft) |
-| `reply_message` | Reply / reply all (or draft) |
-| `forward_message` | Forward with attachments (or draft) |
+| `reply_message` | Reply / reply all — opens as a draft in Mail by default, `draft: false` sends |
+| `forward_message` | Forward with attachments — draft by default, `draft: false` sends |
 | `set_read` | Mark read / unread, one or many |
 | `set_flag` | Flag / unflag with colour |
 | `move_messages` | Move to another folder (`dry_run` available) |

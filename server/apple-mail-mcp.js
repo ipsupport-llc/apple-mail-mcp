@@ -210,18 +210,18 @@ var TOOLS = [
       required: ['id', 'account', 'mailbox'] } },
   { name: 'read_message', description: 'Полный текст письма. id/account/mailbox берутся из list_messages или search_messages.',
     inputSchema: { type: 'object', properties: {
-      id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
-      mark_read: { type: 'boolean', description: 'по умолчанию false' } }, required: ['id', 'account', 'mailbox'] } },
+      id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' } },
+      required: ['id', 'account', 'mailbox'] } },
   { name: 'send_email', description: 'Отправить новое письмо. draft=true — только открыть окно письма в Mail без отправки.',
     inputSchema: { type: 'object', properties: {
       to: { type: 'string', description: 'адреса через запятую' }, cc: { type: 'string' }, bcc: { type: 'string' },
       subject: { type: 'string' }, body: { type: 'string' },
       from: { type: 'string', description: 'адрес отправителя (один из адресов аккаунтов), необязательно' },
       draft: { type: 'boolean' } }, required: ['to', 'subject', 'body'] } },
-  { name: 'reply_message', description: 'Ответить на письмо. draft=true — открыть ответ в Mail без отправки.',
+  { name: 'reply_message', description: 'Ответить на письмо. Mail сам подставляет получателей и цитату, поэтому по умолчанию ответ только открывается в Mail (черновик) — пользователь видит, что уйдёт, и нажимает «Отправить». draft=false — отправить сразу.',
     inputSchema: { type: 'object', properties: {
       id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
-      body: { type: 'string' }, reply_all: { type: 'boolean' }, draft: { type: 'boolean' } },
+      body: { type: 'string' }, reply_all: { type: 'boolean' }, draft: { type: 'boolean', description: 'по умолчанию true' } },
       required: ['id', 'account', 'mailbox', 'body'] } },
   { name: 'list_calendars', description: 'Список календарей в приложении Календарь.',
     inputSchema: { type: 'object', properties: {} } },
@@ -288,10 +288,10 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: {
       ids: { type: 'array', items: { type: 'number' } }, account: { type: 'string' }, mailbox: { type: 'string' },
       flagged: { type: 'boolean' }, color: { type: 'string' } }, required: ['ids', 'account', 'mailbox', 'flagged'] } },
-  { name: 'forward_message', description: 'Forward a message (with its attachments) with an optional note on top. draft=true opens it in Mail instead of sending.',
+  { name: 'forward_message', description: 'Forward a message (with its attachments) with an optional note on top. Mail adds the original text and attachments itself, so by default it only opens in Mail as a draft for the user to check and send. draft=false sends right away.',
     inputSchema: { type: 'object', properties: {
       id: { type: 'number' }, account: { type: 'string' }, mailbox: { type: 'string' },
-      to: { type: 'string' }, cc: { type: 'string' }, bcc: { type: 'string' }, body: { type: 'string' }, draft: { type: 'boolean' } },
+      to: { type: 'string' }, cc: { type: 'string' }, bcc: { type: 'string' }, body: { type: 'string' }, draft: { type: 'boolean', description: 'default true' } },
       required: ['id', 'account', 'mailbox', 'to'] } },
   { name: 'save_attachments', description: 'Save a message\'s attachments to disk (default: the folder from extension settings, else ~/Downloads). Never overwrites.',
     inputSchema: { type: 'object', properties: {
@@ -444,6 +444,7 @@ var HANDLERS = {
   },
   list_attachments: function (a) { return attachmentsOf(getMessage(a)); },
   read_message: function (a) {
+    if (a.mark_read) throw new Error('read never changes mail — use write.set_read to mark it read.');
     var m = getMessage(a);
     var r = {
       id: m.id(), account: a.account, mailbox: a.mailbox, date: iso(m.dateReceived()),
@@ -455,7 +456,6 @@ var HANDLERS = {
       attachments: attachmentsOf(m),
       body: clip(m.content(), 60000)
     };
-    if (a.mark_read) m.readStatus = true;
     return r;
   },
   send_email: function (a) {
@@ -476,11 +476,13 @@ var HANDLERS = {
     try { orig = m.content(); } catch (e) {}
     var quoted = '\n\n' + (m.sender() + ' написал(а) ' + (iso(m.dateReceived()) || '') + ':\n') +
       orig.split('\n').map(function (l) { return '> ' + l; }).join('\n');
-    var r = M.reply(m, { openingWindow: !!a.draft, replyToAll: !!a.reply_all });
+    var draft = a.draft !== false;
+    var r = M.reply(m, { openingWindow: draft, replyToAll: !!a.reply_all });
     r.content = a.body + quoted;
-    if (a.draft) { M.activate(); return 'Ответ открыт в Mail — проверьте и нажмите «Отправить».'; }
+    var who = { to: recips(r.toRecipients()), cc: recips(r.ccRecipients()), subject: r.subject() };
+    if (draft) { M.activate(); return { status: 'Ответ открыт в Mail — проверьте и нажмите «Отправить».', draft: true, to: who.to, cc: who.cc, subject: who.subject }; }
     r.send();
-    return 'Ответ отправлен на: ' + m.sender();
+    return { status: 'Ответ отправлен', to: who.to, cc: who.cc, subject: who.subject };
   },
   set_read: function (a) {
     var mb = getMailbox(a.account, a.mailbox), ids = a.ids || (a.id != null ? [a.id] : []), ok = 0, failed = [];
@@ -504,7 +506,8 @@ var HANDLERS = {
   },
   forward_message: function (a) {
     var M = mail(), m = getMessage(a);
-    var f = M.forward(m, { openingWindow: !!a.draft });
+    var draft = a.draft !== false;
+    var f = M.forward(m, { openingWindow: draft });
     addRecipients(f, 'toRecipients', M.ToRecipient, a.to);
     addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(f, 'bccRecipients', M.BccRecipient, a.bcc);
@@ -516,7 +519,7 @@ var HANDLERS = {
       }
       f.content = a.body + '\n\n' + orig;
     }
-    if (a.draft) { M.activate(); return 'Forward opened in Mail — check it and press Send.'; }
+    if (draft) { M.activate(); return 'Forward opened in Mail — check it and press Send.'; }
     f.send();
     return 'Forwarded to: ' + toList(a.to).join(', ');
   },
@@ -740,7 +743,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.3.0' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.3.1' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
@@ -761,6 +764,7 @@ function handle(req) {
   }
 }
 
+var CANCELLED = {};
 function run() {
   var stdin = $.NSFileHandle.fileHandleWithStandardInput;
   var buf = $.NSMutableData.alloc.init;
@@ -777,12 +781,21 @@ function run() {
     var complete = str.slice(0, nl), rest = str.slice(nl + 1);
     buf = $.NSMutableData.alloc.init;
     if (rest.length) buf.appendData($(rest).dataUsingEncoding($.NSUTF8StringEncoding));
+    // Handlers are synchronous Apple Events and cannot be interrupted, but a request that is
+    // still waiting in the pipe can be dropped: read the whole chunk, note cancellations, then run.
+    var reqs = [];
     complete.split('\n').forEach(function (line) {
       line = line.trim();
       if (!line) return;
-      var req;
-      try { req = JSON.parse(line); } catch (e) { log('bad json: ' + line.slice(0, 200)); return; }
-      handle(req);
+      try { reqs.push(JSON.parse(line)); } catch (e) { log('bad json: ' + line.slice(0, 200)); }
+    });
+    reqs.forEach(function (r) {
+      if (r.method === 'notifications/cancelled' && r.params && r.params.requestId != null) CANCELLED[String(r.params.requestId)] = true;
+    });
+    reqs.forEach(function (r) {
+      if (r.method === 'notifications/cancelled') return;
+      if (r.id != null && CANCELLED[String(r.id)]) { delete CANCELLED[String(r.id)]; log('skipped cancelled request ' + r.id); return; }
+      handle(r);
     });
   }
   log('stdin closed, exiting');
