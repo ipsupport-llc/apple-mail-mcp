@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.5.2'; // release.yml rewrites this from the tag
+var VERSION = '1.5.3'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -1820,7 +1820,7 @@ function onChunk(data) {
     line = line.trim();
     if (!line) return;
     var msg;
-    try { msg = JSON.parse(line); } catch (e) { log('bad json: ' + line.slice(0, 200)); return send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
+    try { msg = JSON.parse(line); } catch (e) { log('bad json (' + line.length + ' chars)'); return send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
     onMessage(msg);
   });
 }
