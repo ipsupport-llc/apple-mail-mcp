@@ -21,7 +21,7 @@ That's it: no Terminal, no config files. Updates and removal live in **Claude â†
 <summary>Manual install (without the .mcpb)</summary>
 
 ```sh
-git clone https://github.com/OWNER/apple-mail-mcp.git ~/code/apple-mail-mcp
+git clone https://github.com/ipsupport-llc/apple-mail-mcp.git ~/code/apple-mail-mcp
 cd ~/code/apple-mail-mcp
 ./install.sh      # adds an "apple-mail" entry to claude_desktop_config.json (with a backup)
 ```
