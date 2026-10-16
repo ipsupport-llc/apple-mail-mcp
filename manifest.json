@@ -1,10 +1,10 @@
 {
   "manifest_version": "0.3",
   "name": "apple-mail-mcp",
-  "display_name": "Apple Mail & Calendar",
-  "version": "1.0.0",
-  "description": "Read, search, send and organize Apple Mail, and manage Apple Calendar — locally, with zero dependencies.",
-  "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS. No Node, Python or Homebrew. Two tools: `read` (never changes anything) and `write` (send, reply, delete to Trash, create/delete events).",
+  "display_name": "Apple Mail, Calendar & Notes",
+  "version": "1.2.0",
+  "description": "Read, search, send and organize Apple Mail, manage Apple Calendar and Apple Notes — locally, with zero dependencies.",
+  "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS. No Node, Python or Homebrew. Two tools: `read` (never changes anything) and `write` (send and reply, folders and rules, Trash, calendar events, notes).",
   "author": {
     "name": "IPSupport LLC",
     "email": "hello@ipsupport.us",
@@ -16,21 +16,40 @@
   },
   "license": "MIT",
   "icon": "icon.png",
-  "keywords": ["apple mail", "calendar", "email", "macos", "jxa"],
+  "keywords": [
+    "apple mail",
+    "calendar",
+    "notes",
+    "email",
+    "macos",
+    "jxa"
+  ],
   "server": {
     "type": "binary",
     "entry_point": "server/apple-mail-mcp.js",
     "mcp_config": {
       "command": "/usr/bin/osascript",
-      "args": ["-l", "JavaScript", "${__dirname}/server/apple-mail-mcp.js"]
+      "args": [
+        "-l",
+        "JavaScript",
+        "${__dirname}/server/apple-mail-mcp.js"
+      ]
     }
   },
   "tools": [
-    { "name": "read", "description": "Read Apple Mail and Calendar: accounts, folders, message lists, search, full messages, calendars, events." },
-    { "name": "write", "description": "Send and reply to email, mark read, move messages to Trash, create and delete calendar events." }
+    {
+      "name": "read",
+      "description": "Read Apple Mail, Calendar and Notes: accounts, folders, messages, search, rules, calendars, events, notes."
+    },
+    {
+      "name": "write",
+      "description": "Send and reply to email, organize folders and rules, move to Trash, create/delete events, create/update/delete notes."
+    }
   ],
   "tools_generated": false,
   "compatibility": {
-    "platforms": ["darwin"]
+    "platforms": [
+      "darwin"
+    ]
   }
 }

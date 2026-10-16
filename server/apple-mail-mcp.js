@@ -1,4 +1,4 @@
-// Apple Mail MCP server — zero dependencies, runs on macOS built-in JXA.
+// Apple Mail, Calendar & Notes MCP server — zero dependencies, runs on macOS built-in JXA.
 // Run:  /usr/bin/osascript -l JavaScript server/apple-mail-mcp.js
 // Protocol: MCP over stdio (newline-delimited JSON-RPC 2.0). Logs go to stderr.
 
@@ -12,6 +12,34 @@ function mail() {
 
 var Cal = null;
 function cal() { if (!Cal) Cal = Application('Calendar'); return Cal; }
+var NotesApp = null;
+function notes() { if (!NotesApp) NotesApp = Application('Notes'); return NotesApp; }
+
+function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+// Plain text -> Notes HTML (one <div> per line). Pass html:true to send raw HTML instead.
+function toNoteHtml(text, isHtml) {
+  if (isHtml) return String(text);
+  return String(text).split('\n').map(function (l) { return '<div>' + (l ? esc(l) : '<br>') + '</div>'; }).join('');
+}
+function noteFolder(account, folder) {
+  var N = notes(), f;
+  if (account) f = N.accounts.byName(account).folders.byName(folder);
+  else f = N.folders.byName(folder);
+  f.name();
+  return f;
+}
+function getNote(id) { var n = notes().notes.byId(String(id)); n.name(); return n; }
+function noteSummary(spec, limit) {
+  var ids = spec.id();
+  if (!ids.length) return [];
+  var names = spec.name(), mod = spec.modificationDate();
+  var idx = ids.map(function (_, i) { return i; });
+  idx.sort(function (x, y) { return (mod[y] || 0) - (mod[x] || 0); });
+  return idx.slice(0, limit).map(function (i) {
+    var folder = null; try { folder = spec[i].container().name(); } catch (e) {}
+    return { id: ids[i], title: names[i], folder: folder, modified: iso(mod[i]) };
+  });
+}
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -132,6 +160,23 @@ var TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, enabled: { type: 'boolean' } }, required: ['name', 'enabled'] } },
   { name: 'delete_rule', description: 'Delete a rule by name.',
     inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+  { name: 'list_note_folders', description: 'Apple Notes accounts and folders with note counts.',
+    inputSchema: { type: 'object', properties: {} } },
+  { name: 'list_notes', description: 'Notes sorted by last modified. Without folder — all notes.',
+    inputSchema: { type: 'object', properties: { folder: { type: 'string' }, account: { type: 'string', description: 'Notes account, e.g. iCloud' },
+      limit: { type: 'number', description: 'default 30' } } } },
+  { name: 'search_notes', description: 'Search notes by title and text (substring).',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number', description: 'default 20' } }, required: ['query'] } },
+  { name: 'read_note', description: 'Full note as plain text (id from list_notes/search_notes). html:true returns the HTML body.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, html: { type: 'boolean' } }, required: ['id'] } },
+  { name: 'create_note', description: 'Create a note. body is plain text (lines kept) unless html:true. Default folder: Notes.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' }, html: { type: 'boolean' },
+      folder: { type: 'string' }, account: { type: 'string' } }, required: ['title'] } },
+  { name: 'update_note', description: 'Change a note: append:true adds text to the end, otherwise replaces the body (title kept unless a new one is given).',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, body: { type: 'string' }, html: { type: 'boolean' },
+      append: { type: 'boolean' }, title: { type: 'string' } }, required: ['id', 'body'] } },
+  { name: 'delete_note', description: 'Delete a note (goes to Recently Deleted in Notes, recoverable ~30 days).',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
   { name: 'delete_event', description: 'Удалить событие календаря по uid (uid из list_events).',
     inputSchema: { type: 'object', properties: { uid: { type: 'string' }, calendar: { type: 'string' } }, required: ['uid'] } },
   { name: 'delete_messages', description: 'Переместить письма в Корзину (не безвозвратно). ids — список id из одной папки.',
@@ -306,6 +351,49 @@ var HANDLERS = {
   },
   set_rule_enabled: function (a) { var r = mail().rules.byName(a.name); r.name(); r.enabled = !!a.enabled; return 'ok'; },
   delete_rule: function (a) { var M = mail(), r = M.rules.byName(a.name); r.name(); M.delete(r); return 'Rule deleted: ' + a.name; },
+  list_note_folders: function () {
+    return notes().accounts().map(function (acc) {
+      return { account: acc.name(), folders: acc.folders().map(function (f) {
+        var n = 0; try { n = f.notes.length; } catch (e) {} return { folder: f.name(), notes: n }; }) };
+    });
+  },
+  list_notes: function (a) {
+    var spec = a.folder ? noteFolder(a.account, a.folder).notes : notes().notes;
+    return noteSummary(spec, a.limit || 30);
+  },
+  search_notes: function (a) {
+    var q = String(a.query);
+    var spec = notes().notes.whose({ _or: [{ name: { _contains: q } }, { plaintext: { _contains: q } }] });
+    return noteSummary(spec, a.limit || 20);
+  },
+  read_note: function (a) {
+    var n = getNote(a.id), r = { id: a.id, title: n.name() };
+    try { r.folder = n.container().name(); } catch (e) {}
+    try { r.created = iso(n.creationDate()); r.modified = iso(n.modificationDate()); } catch (e) {}
+    try { r.locked = n.passwordProtected(); } catch (e) {}
+    if (r.locked) { r.body = null; r.note = 'Note is locked; unlock it in Notes first.'; return r; }
+    r.body = clip(a.html ? n.body() : n.plaintext(), 60000);
+    return r;
+  },
+  create_note: function (a) {
+    var N = notes();
+    var target = a.folder ? noteFolder(a.account, a.folder) : (a.account ? N.accounts.byName(a.account).defaultFolder() : N.defaultAccount().defaultFolder());
+    var html = '<div><h1>' + esc(a.title) + '</h1></div>' + (a.body ? toNoteHtml(a.body, a.html) : '');
+    var n = N.Note({ body: html });
+    target.notes.push(n);
+    var made = target.notes.whose({ name: a.title })();
+    var id = made.length ? made[made.length - 1].id() : null;
+    return { created: true, id: id, title: a.title, folder: target.name() };
+  },
+  update_note: function (a) {
+    var n = getNote(a.id);
+    try { if (n.passwordProtected()) throw new Error('Note is locked'); } catch (e) { if (e.message === 'Note is locked') throw e; }
+    var add = toNoteHtml(a.body, a.html);
+    if (a.append) n.body = n.body() + add;
+    else n.body = '<div><h1>' + esc(a.title || n.name()) + '</h1></div>' + add;
+    return { updated: true, id: a.id, title: n.name() };
+  },
+  delete_note: function (a) { var N = notes(), n = getNote(a.id), t = n.name(); N.delete(n); return 'Deleted (Recently Deleted): ' + t; },
   delete_event: function (a) {
     var C = cal(), cals = a.calendar ? [C.calendars.byName(a.calendar)] : C.calendars(), n = 0;
     cals.forEach(function (c) {
@@ -325,9 +413,11 @@ var HANDLERS = {
 };
 
 // ---------- two public tools: read / write ----------
-var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'list_rules', 'list_calendars', 'list_events'];
+var READ_ACTIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'list_rules', 'list_calendars', 'list_events',
+  'list_note_folders', 'list_notes', 'search_notes', 'read_note'];
 var WRITE_ACTIONS = ['send_email', 'reply_message', 'set_read', 'delete_messages', 'create_mailbox', 'move_messages',
-  'create_rule', 'set_rule_enabled', 'delete_rule', 'create_event', 'delete_event'];
+  'create_rule', 'set_rule_enabled', 'delete_rule', 'create_event', 'delete_event',
+  'create_note', 'update_note', 'delete_note'];
 
 function describe(actions) {
   return actions.map(function (n) {
@@ -347,10 +437,10 @@ function publicTool(name, title, actions, annotations) {
       args: { type: 'object', description: 'аргументы выбранного action' } }, required: ['action'] } };
 }
 var PUBLIC_TOOLS = [
-  publicTool('read', 'Read Apple Mail and Calendar (never changes anything).', READ_ACTIONS,
-    { title: 'Read mail & calendar', readOnlyHint: true, destructiveHint: false, openWorldHint: false }),
-  publicTool('write', 'Change Apple Mail and Calendar: send, reply, delete, create events.', WRITE_ACTIONS,
-    { title: 'Send / change mail & calendar', readOnlyHint: false, destructiveHint: true, openWorldHint: true })
+  publicTool('read', 'Read Apple Mail, Calendar and Notes (never changes anything).', READ_ACTIONS,
+    { title: 'Read mail, calendar & notes', readOnlyHint: true, destructiveHint: false, openWorldHint: false }),
+  publicTool('write', 'Change Apple Mail, Calendar and Notes: send, reply, organize mail, rules, events, notes.', WRITE_ACTIONS,
+    { title: 'Change mail, calendar & notes', readOnlyHint: false, destructiveHint: true, openWorldHint: true })
 ];
 function callPublic(name, a) {
   var allowed = name === 'read' ? READ_ACTIONS : name === 'write' ? WRITE_ACTIONS : null;
@@ -368,7 +458,7 @@ function handle(req) {
       return send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: p.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'apple-mail-jxa', version: '1.1.2' } } });
+        serverInfo: { name: 'apple-mail-jxa', version: '1.2.0' } } });
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });

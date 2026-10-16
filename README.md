@@ -1,9 +1,9 @@
 # apple-mail-mcp
 
-An MCP server that gives Claude Desktop access to **Apple Mail** and **Apple Calendar** on macOS.
+An MCP server that gives Claude Desktop access to **Apple Mail**, **Apple Calendar** and **Apple Notes** on macOS.
 
 - **Zero dependencies.** No Node, Python or Homebrew. It runs on JavaScript for Automation (JXA), which ships with every Mac (`/usr/bin/osascript`).
-- **Local only.** Talks to Mail.app and Calendar.app on your machine through Apple Events. Nothing is sent anywhere except what Claude itself sees.
+- **Local only.** Talks to Mail.app, Calendar.app and Notes.app on your machine through Apple Events. Nothing is sent anywhere except what Claude itself sees.
 - **Two tools, two permission prompts.** Everything is grouped into `read` (never changes anything) and `write` (sends, deletes, creates).
 - **One-click install** as a Claude Desktop Extension (`.mcpb`).
 
@@ -13,7 +13,7 @@ Requirements: macOS and [Claude Desktop](https://claude.ai/download). Apple Mail
 
 1. Download **`apple-mail-mcp.mcpb`** from the [latest release](../../releases/latest).
 2. Double-click it (or drag it into the Claude window). Claude shows the extension details — click **Install**.
-3. On first use macOS asks whether **Claude may control Mail / Calendar** — click **Allow**.
+3. On first use macOS asks whether **Claude may control Mail / Calendar / Notes** — click **Allow**.
 
 That's it: no Terminal, no config files. Updates and removal live in **Claude → Settings → Extensions**.
 
@@ -21,7 +21,7 @@ That's it: no Terminal, no config files. Updates and removal live in **Claude �
 <summary>Manual install (without the .mcpb)</summary>
 
 ```sh
-git clone https://github.com/OWNER/apple-mail-mcp.git ~/code/apple-mail-mcp
+git clone https://github.com/ipsupport-llc/apple-mail-mcp.git ~/code/apple-mail-mcp
 cd ~/code/apple-mail-mcp
 ./install.sh      # adds an "apple-mail" entry to claude_desktop_config.json (with a backup)
 ```
@@ -51,6 +51,10 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | `list_rules` | Mail rules with their conditions and actions |
 | `list_calendars` | Calendars and whether they are writable |
 | `list_events` | Events in a date range, with `uid` |
+| `list_note_folders` | Notes accounts and folders with note counts |
+| `list_notes` | Notes by last modified, optionally in one folder |
+| `search_notes` | Search notes by title and text |
+| `read_note` | Full note as plain text (or HTML) |
 
 ### `write`
 
@@ -67,10 +71,13 @@ Each tool takes `{ "action": "...", "args": { ... } }`.
 | `delete_rule` | Delete a rule |
 | `create_event` | New calendar event (ISO 8601 times with offset) |
 | `delete_event` | Delete an event by `uid` |
+| `create_note` | New note from plain text (or HTML), in any folder |
+| `update_note` | Append to a note or replace its body |
+| `delete_note` | Delete a note (to Recently Deleted) |
 
 Message ids come from `list_messages` / `search_messages` and are scoped to `account` + `mailbox`.
 
-## Notes on rules
+## Notes on Mail rules
 
 Apple Mail rules run only while Mail is open on the Mac, and only on new mail. To sort existing mail, search and use `move_messages`. If your mail server supports Sieve, server-side filters are more reliable across devices.
 
@@ -79,19 +86,20 @@ Apple Mail rules run only while Mail is open on the Mac, and only on new mail. T
 Push a tag — GitHub Actions validates the manifest, builds `apple-mail-mcp.mcpb` and attaches it to a release:
 
 ```sh
-git tag v1.0.1 && git push --tags
+git tag v1.2.1 && git push --tags
 ```
 
 ## Security notes
 
 - Anything Claude reads (email bodies included) becomes part of its context. A malicious email could try to instruct Claude to do something. Keep `write` on manual approval unless you trust the workflow.
-- Deleting only moves mail to Trash; nothing is permanently erased.
+- Deleting only moves mail to Trash and notes to Recently Deleted; nothing is permanently erased.
 - The server has no network code. Read `server/apple-mail-mcp.js` — it is one file.
 
 ## Troubleshooting
 
 - **Tools don't show up in Claude** — check Settings → Extensions that *Apple Mail & Calendar* is enabled, then Cmd+Q and reopen Claude. For a manual install, validate the config: `plutil -lint ~/Library/Application\ Support/Claude/claude_desktop_config.json`.
-- **"Not authorized to send Apple events"** — System Settings → Privacy & Security → Automation → enable Mail / Calendar for Claude (and Terminal for `test.sh`).
+- **"Not authorized to send Apple events"** — System Settings → Privacy & Security → Automation → enable Mail / Calendar / Notes for Claude (and Terminal for `test.sh`).
+- **Locked notes** — password-protected notes can't be read until you unlock them in Notes.
 - **Slow searches** — Apple Mail scripting is slow on huge folders. Pass `account` and `mailbox` to narrow the search.
 - **Logs** — Claude Desktop writes server stderr to `~/Library/Logs/Claude/` (`mcp-server-*.log`).
 
