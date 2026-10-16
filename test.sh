@@ -1,5 +1,5 @@
 #!/bin/bash
-# Talks to the server directly (no Claude) and prints accounts and calendars.
+# Talks to the server directly (no MCP client) and prints accounts and calendars.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
