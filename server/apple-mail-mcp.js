@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.4.0'; // release.yml rewrites this from the tag
+var VERSION = '1.5.0'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -23,12 +23,17 @@ function log(s) { console.log('[apple-mail-mcp] ' + s); } // stderr
 
 // ---------- config (env from the MCP client; the .mcpb maps its extension settings to these) ----------
 function env(k) {
-  try {
-    var v = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey(k));
-    return (v && String(v).indexOf('${') !== 0) ? String(v) : ''; // unset settings arrive as "${user_config.x}"
-  } catch (e) { return ''; }
+  var v = '';
+  try { v = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey(k)) || ''; } catch (e) {}
+  v = String(v);
+  return /^\$\{user_config\.[^}]*\}$/.test(v) ? '' : v; // an unset extension setting arrives as "${user_config.x}"
 }
-function stdPath(p) { return ObjC.unwrap($(String(p)).stringByExpandingTildeInPath.stringByStandardizingPath.stringByResolvingSymlinksInPath); }
+// ~, ${HOME} and $HOME expanded (some clients store them literally), then normalised
+function stdPath(p) {
+  var home = ObjC.unwrap($.NSHomeDirectory());
+  p = String(p).replace(/^\$\{HOME\}|^\$HOME(?=\/|$)/, home);
+  return ObjC.unwrap($(p).stringByExpandingTildeInPath.stringByStandardizingPath.stringByResolvingSymlinksInPath);
+}
 var READ_ONLY = /^(1|true|yes)$/i.test(env('APPLE_MAIL_READ_ONLY'));
 var DEFAULT_ACCOUNT = env('APPLE_MAIL_DEFAULT_ACCOUNT');
 var SAVE_DIR = stdPath(env('APPLE_MAIL_SAVE_DIR') || '~/Downloads');
@@ -115,7 +120,7 @@ var KEY_ALIASES = { // alias → canonical; used only when the action has the ca
   files: 'names', filenames: 'names', file_names: 'names', attachment_names: 'names',
   is_read: 'read', seen: 'read', mark_read: 'read', as_read: 'read',
   is_flagged: 'flagged', flag: 'flagged',
-  as_draft: 'draft', preview: 'draft',
+  as_draft: 'draft', preview: 'dry_run',
   all: 'reply_all', replyall: 'reply_all', to_all: 'reply_all',
   destination: 'to_mailbox', target: 'to_mailbox', target_mailbox: 'to_mailbox', to_folder: 'to_mailbox', target_folder: 'to_mailbox', dest: 'to_mailbox',
   target_account: 'to_account', destination_account: 'to_account',
@@ -385,6 +390,12 @@ function realBox(m, fallback) { // where a message actually lives
     return { ref: mb, account: acc, path: name, role: roleOfName(roleIndex(), acc, name) };
   }, fallback);
 }
+// The unified inbox as each account's own inbox, so every row knows its account and folder without extra lookups.
+function inboxesOf(box) {
+  if (!box.unified) return [box];
+  var list = safe(function () { return mail().inbox.mailboxes(); }, []).map(function (mb) { return { ref: mb, account: accountOfBox(mb), path: safe(function () { return mb.name(); }, 'INBOX'), role: 'inbox' }; });
+  return list.length ? list : [box];
+}
 
 // Message lookup. Mail message ids are unique across folders, so a wrong folder is recovered by searching.
 function getMessage(a) {
@@ -428,6 +439,27 @@ function rowOut(r) {
     replied: r.replied, forwarded: r.forwarded, flagged: r.flagged };
 }
 function newestFirst(a, b) { return (b.date || 0) - (a.date || 0); }
+// The newest messages matching conds, without bulk-reading a whole large mailbox: small folders are read at once,
+// big ones through date windows that widen only until there are enough messages.
+var WINDOW_DAYS = [3, 14, 60, 365, null];
+// keep(rows) → rows that count (default: all); windows widen until enough rows count.
+function newestRows(box, conds, limit, withRecipients, keep) {
+  function spec(extra) { var c = conds.concat(extra || []); return c.length ? box.ref.messages.whose(c.length > 1 ? { _and: c } : c[0]) : box.ref.messages; }
+  keep = keep || function (rows) { return rows; };
+  var hasDate = conds.some(function (c) { return c.dateReceived; });
+  var size = safe(function () { return Number(box.ref.messages.length); }, 0);
+  if (hasDate || size <= 300) return keep(rowsOf(spec(), box, withRecipients).sort(newestFirst));
+  for (var i = 0; i < WINDOW_DAYS.length; i++) {
+    var d = WINDOW_DAYS[i], s = spec(d ? [{ dateReceived: { _greaterThan: daysAgo(d) } }] : []);
+    var n = safe(function () { return s.id().length; }, 0);
+    if (n >= limit || d === null) {
+      var rows = keep(rowsOf(s, box, withRecipients).sort(newestFirst));
+      if (rows.length >= limit || d === null) return rows;
+    }
+    checkCancelled();
+  }
+  return [];
+}
 function dedupe(rows) { // one message can sit in several folders (Gmail "All Mail")
   var seen = Object.create(null);
   return rows.filter(function (r) { var k = r.messageId || (r.id + '|' + (r.box ? boxLabel(r.box) : '')); if (seen[k]) return false; seen[k] = 1; return true; });
@@ -462,6 +494,33 @@ function eachSent(account, cutoff, f) {
     var subs = spec.subject(), dates = spec.dateSent(), rcpt = recipientsOf(spec);
     ids.forEach(function (id, i) { f(b, id, subs[i], dates[i], rcpt[i] || []); });
   });
+}
+// What a reply would be: Reply-To (or the sender) as To; with reply_all also everyone else, minus your own addresses.
+function replyPlan(m, a) {
+  var me = myAddresses(), subject = m.subject() || '', from = m.sender(), replyTo = trim(safe(function () { return m.replyTo(); }, '') || '');
+  var to = [replyTo || from], cc = [], seen = {};
+  seen[addrOf(to[0])] = 1;
+  if (a.reply_all) recips(m.toRecipients()).concat(recips(m.ccRecipients())).forEach(function (r) {
+    var x = addrOf(r);
+    if (!x || me[x] || seen[x]) return;
+    seen[x] = 1; cc.push(r);
+  });
+  var orig = safe(function () { return m.content(); }, '') || '';
+  return { to: to, cc: cc, subject: /^re:/i.test(subject) ? subject : 'Re: ' + subject,
+    body: a.body + '\n\n' + from + ' wrote on ' + (iso(m.dateReceived()) || '') + ':\n' + orig.split('\n').map(function (l) { return '> ' + l; }).join('\n') };
+}
+function addrSet(list) { return list.map(addrOf).filter(Boolean).sort().filter(function (x, i, all) { return all.indexOf(x) === i; }).join(', '); }
+// The approval card only shows the arguments; results show what Mail actually has.
+function outgoingInfo(o, fromFallback) {
+  return { from: safe(function () { return o.sender(); }, '') || fromFallback || null, to: recips(o.toRecipients()), cc: recips(o.ccRecipients()),
+    bcc: safe(function () { return recips(o.bccRecipients()); }, []), subject: safe(function () { return o.subject(); }, null),
+    body_chars: (safe(function () { return o.content(); }, '') || '').length };
+}
+function sentInfo(info) {
+  info.status = 'Sent.';
+  info.sent_at = iso(new Date());
+  note("Mail's scripting does not return the sent message's id; it is in the account's Sent folder.");
+  return info;
 }
 function ensureSent(ok, what) { if (ok === false) fail('Mail did not send the ' + what + ' (it reported a failure).', 'Check the account in Mail, then try once more.'); }
 function messageIds(a) {
@@ -502,16 +561,25 @@ function summary(found) {
 // AppleScript string literal (create_rule builds an AppleScript)
 function q(v) { return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '\\n').replace(/\t/g, '\\t') + '"'; }
 // Rule actions create_rule cannot rebuild (so a copy of the rule would be incomplete).
-function ruleExtras(r) {
+function extraActions(v) {
   var out = [];
-  [['forward', function () { return r.forwardMessage(); }], ['redirect', function () { return r.redirectMessage(); }],
-    ['reply', function () { return r.replyText(); }], ['copy to a folder', function () { return r.shouldCopyMessage(); }],
-    ['play a sound', function () { return r.playSound(); }], ['run a script', function () { return r.runScript(); }],
-    ['colour', function () { return r.highlightTextUsingColor() || r.colorMessage() !== 'none'; }]].forEach(function (p) {
-    var v = safe(p[1], null);
-    if (v && v !== 'none' && !(v && typeof v === 'object' && !Object.keys(v).length)) out.push(p[0]);
-  });
+  if (v.forward) out.push('forward');
+  if (v.redirect) out.push('redirect');
+  if (v.reply) out.push('reply');
+  if (v.copy) out.push('copy to a folder');
+  if (v.sound) out.push('play a sound');
+  if (v.script) out.push('run a script');
+  if (v.highlight || (v.color && v.color !== 'none')) out.push('colour');
   return out;
+}
+function ruleExtras(r) {
+  function get(f) { return safe(function () { return r[f](); }, null); }
+  return extraActions({ forward: get('forwardMessage'), redirect: get('redirectMessage'), reply: get('replyText'), copy: get('shouldCopyMessage'),
+    sound: get('playSound'), script: get('runScript'), highlight: get('highlightTextUsingColor'), color: get('colorMessage') });
+}
+function ruleConditionsOf(r) { // three Apple Events per rule, not three per condition
+  var c = r.ruleConditions, field = safe(function () { return c.ruleType(); }, []), op = safe(function () { return c.qualifier(); }, []), value = safe(function () { return c.expression(); }, []);
+  return field.map(function (f, i) { return { field: f, op: op[i], value: value[i] }; });
 }
 // AppleScript reference for a resolved mailbox, nested ones as "mailbox "B" of mailbox "A" of account …"
 function mailboxRef(box) {
@@ -549,8 +617,9 @@ var MAIL = {
     return allBoxes(getAccount(a.account).name()).map(function (b) { return { mailbox: b.path, role: b.role, unread: safe(function () { return b.ref.unreadCount(); }, null) }; });
   },
   list_messages: function (a) {
-    var box = getMailbox(a.account, a.mailbox);
-    return rowsOf(a.unread ? box.ref.messages.whose({ readStatus: false }) : box.ref.messages, box).sort(newestFirst).slice(0, a.limit).map(rowOut);
+    var rows = [];
+    inboxesOf(getMailbox(a.account, a.mailbox)).forEach(function (b) { rows = rows.concat(newestRows(b, a.unread ? [{ readStatus: false }] : [], a.limit)); });
+    return rows.sort(newestFirst).slice(0, a.limit).map(rowOut);
   },
   search_messages: function (a) {
     var conds = [];
@@ -568,22 +637,25 @@ var MAIL = {
     if (a.unread) conds.push({ readStatus: false });
     if (a.flagged) conds.push({ flaggedStatus: true });
     if (!conds.length && !a.has_attachments) fail('Nothing to search for.', 'Give query, or a filter: from, subject, from_date, to_date, unread, flagged, has_attachments.');
-    var boxes = a.all_mailboxes ? allBoxes(a.account).filter(function (b) { return NOT_MAIL.indexOf(b.role) < 0; }) : [getMailbox(a.account, a.mailbox)];
+    var boxes = a.all_mailboxes ? allBoxes(a.account).filter(function (b) { return NOT_MAIL.indexOf(b.role) < 0; }) : inboxesOf(getMailbox(a.account, a.mailbox));
+    // With has_attachments the windows widen until enough messages *with attachments* are found (one check per message, capped).
+    var checked = 0, MAX_CHECKS = 300, capped = false, seen = {};
+    function withAttachments(rows) {
+      return rows.filter(function (r) {
+        var k = r.messageId || r.id + '|' + boxLabel(r.box);
+        if (k in seen) return seen[k];
+        if (checked >= MAX_CHECKS) { capped = true; return false; }
+        checked++;
+        return (seen[k] = !!safe(function () { return r.spec[r.i].mailAttachments().length; }, 0));
+      });
+    }
     var rows = [];
     boxes.forEach(function (b) {
       checkCancelled();
-      rows = rows.concat(rowsOf(conds.length ? b.ref.messages.whose(conds.length > 1 ? { _and: conds } : conds[0]) : b.ref.messages, b));
+      rows = rows.concat(newestRows(b, conds, a.limit, false, a.has_attachments ? withAttachments : null));
     });
-    rows = dedupe(rows).sort(newestFirst);
-    var out = [], checked = 0, MAX_CHECKS = 300;
-    for (var k = 0; k < rows.length && out.length < a.limit; k++) {
-      if (a.has_attachments) {
-        if (++checked > MAX_CHECKS) { note('Stopped after checking ' + MAX_CHECKS + ' messages for attachments; narrow the search (dates, from, mailbox).'); break; }
-        var r = rows[k];
-        if (!safe(function () { return r.spec[r.i].mailAttachments().length; }, 0)) continue;
-      }
-      out.push(rowOut(rows[k]));
-    }
+    if (capped) note('Stopped after checking ' + MAX_CHECKS + ' messages for attachments; narrow the search (dates, from, mailbox) for more.');
+    var out = dedupe(rows).sort(newestFirst).slice(0, a.limit).map(rowOut);
     if (!out.length && !a.all_mailboxes) note('Searched only ' + boxes.map(boxLabel).join(', ') + '. all_mailboxes:true searches every folder.');
     return out;
   },
@@ -623,8 +695,9 @@ var MAIL = {
       var subj = normSubject(subject);
       if (subj) rcpt.forEach(function (who) { var k = subj + '\u0000' + who; if (!lastMine[k] || date > lastMine[k]) lastMine[k] = date; });
     });
-    var inbox = getMailbox(a.account, 'INBOX'), latest = Object.create(null);
-    rowsOf(inbox.ref.messages.whose({ dateReceived: { _greaterThan: cutoff } }), inbox).forEach(function (r) {
+    var latest = Object.create(null), rows = [];
+    inboxesOf(getMailbox(a.account, 'INBOX')).forEach(function (b) { rows = rows.concat(rowsOf(b.ref.messages.whose({ dateReceived: { _greaterThan: cutoff } }), b)); });
+    rows.forEach(function (r) {
       var who = addrOf(r.from);
       if (!who || me[who] || BOT_SENDER.test(who)) return;
       var k = (normSubject(r.subject) || ('#' + r.id)) + '\u0000' + who;
@@ -670,13 +743,18 @@ var MAIL = {
       attachments: attachmentsOf(m), body: body.text, body_chars: body.total_chars, next_offset: body.next_offset
     };
   },
-  list_rules: function () {
-    return mail().rules().map(function (r) {
-      var mv = safe(function () { if (!r.shouldMoveMessage()) return null; var mb = r.moveMessage(); return mb.account().name() + ' / ' + mb.name(); }, null);
-      var o = { name: r.name(), enabled: r.enabled(), match: r.allConditionsMustBeMet() ? 'all' : 'any',
-        conditions: safe(function () { return r.ruleConditions(); }, []).map(function (c) { return { field: c.ruleType(), op: c.qualifier(), value: c.expression() }; }),
-        move_to: mv, mark_read: r.markRead(), flag: safe(function () { return r.markFlagged(); }, null), 'delete': r.deleteMessage(), stop: r.stopEvaluatingRules() };
-      var other = ruleExtras(r);
+  list_rules: function () { // one Apple Event per field for all rules, then conditions and targets per rule
+    var R = mail().rules, names = safe(function () { return R.name(); }, []);
+    function bulk(f) { return safe(function () { return R[f](); }, []); }
+    var enabled = bulk('enabled'), all = bulk('allConditionsMustBeMet'), move = bulk('shouldMoveMessage'), read = bulk('markRead'), flag = bulk('markFlagged'),
+      del = bulk('deleteMessage'), stop = bulk('stopEvaluatingRules'), fwd = bulk('forwardMessage'), redir = bulk('redirectMessage'), reply = bulk('replyText'),
+      copy = bulk('shouldCopyMessage'), sound = bulk('playSound'), script = bulk('runScript'), hl = bulk('highlightTextUsingColor'), color = bulk('colorMessage');
+    return names.map(function (n, i) {
+      var r = R[i];
+      var mv = move[i] ? safe(function () { var mb = r.moveMessage(); return mb.account().name() + ' / ' + mb.name(); }, null) : null;
+      var o = { name: n, enabled: enabled[i], match: all[i] ? 'all' : 'any',
+        conditions: ruleConditionsOf(r), move_to: mv, mark_read: read[i], flag: flag[i], 'delete': del[i], stop: stop[i] };
+      var other = extraActions({ forward: fwd[i], redirect: redir[i], reply: reply[i], copy: copy[i], sound: sound[i], script: script[i], highlight: hl[i], color: color[i] });
       if (other.length) o.other_actions = other;
       return o;
     });
@@ -690,54 +768,66 @@ var MAIL = {
       note('Sending from ' + accAddr + ' (account ' + acc + ').');
       a.from = accAddr;
     }
+    var plan = { from: a.from || "the account's default address", to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: a.subject, body: a.body };
+    if (a.dry_run) return { dry_run: true, would_send: plan };
     var msg = M.OutgoingMessage({ subject: a.subject, content: a.body, visible: a.draft });
     M.outgoingMessages.push(msg);
     addRecipients(msg, 'toRecipients', M.ToRecipient, a.to);
     addRecipients(msg, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(msg, 'bccRecipients', M.BccRecipient, a.bcc);
     if (a.from) msg.sender = a.from;
-    var info = { to: a.to, cc: a.cc, bcc: a.bcc, subject: a.subject };
+    var info = outgoingInfo(msg, plan.from);
     if (a.draft) { M.activate(); info.status = 'Draft opened in Mail. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(msg.send(), 'email');
-    info.status = 'Sent.';
-    return info;
+    return sentInfo(info);
   },
-  // Mail fills in the recipients and the quote itself, so a reply opens as a draft unless draft:false.
+  // Recipients and quote are worked out here (Reply-To, reply-all minus your own addresses) so dry_run shows exactly
+  // what goes out, and a real send stops if Mail would address it differently.
   reply_message: function (a) {
-    var M = mail(), m = getMessage(a).ref, orig = safe(function () { return m.content(); }, '') || '';
-    var quoted = '\n\n' + m.sender() + ' wrote on ' + (iso(m.dateReceived()) || '') + ':\n' + orig.split('\n').map(function (l) { return '> ' + l; }).join('\n');
+    var M = mail(), m = getMessage(a).ref, plan = replyPlan(m, a);
+    if (a.dry_run) return { dry_run: true, would_send: plan };
     var r = M.reply(m, { openingWindow: a.draft, replyToAll: a.reply_all });
-    r.content = a.body + quoted;
-    var info = { to: recips(r.toRecipients()), cc: recips(r.ccRecipients()), subject: r.subject() };
+    r.content = plan.body;
+    var info = outgoingInfo(r), want = addrSet(plan.to.concat(plan.cc)), got = addrSet(info.to.concat(info.cc));
+    if (want !== got) {
+      if (!a.draft) {
+        safe(function () { r.close({ saving: 'no' }); });
+        fail('Mail would address this reply to ' + (got || 'nobody') + ', not ' + want + ' as previewed. Nothing was sent.', 'Use draft:true so the user can check the recipients in Mail.');
+      }
+      note('Mail addressed the draft to ' + (got || 'nobody') + ' (expected ' + want + '); tell the user to check the recipients.');
+    }
     if (a.draft) { M.activate(); info.status = 'Reply opened in Mail as a draft. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(r.send(), 'reply');
-    info.status = 'Reply sent.';
-    return info;
+    return sentInfo(info);
   },
   forward_message: function (a) {
-    var M = mail(), m = getMessage(a).ref, attachments = attachmentsOf(m).length;
+    var M = mail(), m = getMessage(a).ref, files = attachmentsOf(m), original = '---------- Forwarded message ----------\nFrom: ' + m.sender() +
+      '\nDate: ' + (iso(m.dateReceived()) || '') + '\nSubject: ' + m.subject() + '\n\n' + (safe(function () { return m.content(); }, '') || '');
+    var plan = { to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: /^(fwd?|fw):/i.test(m.subject()) ? m.subject() : 'Fwd: ' + m.subject(),
+      body: (a.body ? a.body + '\n\n' : '') + original, attachments: files.map(function (x) { return x.name; }) };
+    if (a.dry_run) {
+      plan.body = page(plan.body, 0, 20000).text;
+      note("Mail writes the forwarded part itself (its own header and formatting), so that part of the body is close to, not exactly, what is sent. Recipients, subject, note and attachments are exact.");
+      return { dry_run: true, would_send: plan };
+    }
     var f = M.forward(m, { openingWindow: a.draft });
     addRecipients(f, 'toRecipients', M.ToRecipient, a.to);
     addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(f, 'bccRecipients', M.BccRecipient, a.bcc);
-    if (a.body) {
-      var orig = safe(function () { return f.content(); }, '') || ('---------- Forwarded message ----------\nFrom: ' + m.sender() + '\nDate: ' + (iso(m.dateReceived()) || '') +
-        '\nSubject: ' + m.subject() + '\n\n' + safe(function () { return m.content(); }, ''));
-      f.content = a.body + '\n\n' + orig;
-    }
-    var kept = safe(function () { return f.mailAttachments().length; }, attachments);
-    var info = { to: recips(f.toRecipients()), cc: recips(f.ccRecipients()), subject: safe(function () { return f.subject(); }, null), attachments: kept };
-    if (kept < attachments) {
+    if (a.body) f.content = a.body + '\n\n' + (safe(function () { return f.content(); }, '') || original);
+    var kept = safe(function () { return f.mailAttachments().length; }, files.length);
+    var info = outgoingInfo(f);
+    info.attachments = kept;
+    if (kept < files.length) {
       if (!a.draft) { safe(function () { f.close({ saving: 'no' }); }); fail('Adding the note dropped the attachments, so nothing was sent.', 'Forward without "body", or use draft:true and let the user add the note in Mail.'); }
-      note('Mail dropped ' + (attachments - kept) + ' attachment(s) when the note was added; tell the user to check the draft.');
+      note('Mail dropped ' + (files.length - kept) + ' attachment(s) when the note was added; tell the user to check the draft.');
     }
     if (a.draft) { M.activate(); info.status = 'Forward opened in Mail as a draft. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(f.send(), 'forward');
-    info.status = 'Forwarded.';
-    return info;
+    return sentInfo(info);
   },
   set_read: function (a) {
     var r = eachMessage(a, function (found) { found.ref.readStatus = a.read; });
@@ -1226,23 +1316,23 @@ var ACTIONS = {
       from_date: { type: 'date', desc: 'e.g. 2026-10-01 or "7 days ago"' }, to_date: { type: 'date', endOfDay: true },
       unread: { type: 'boolean' }, flagged: { type: 'boolean' }, has_attachments: { type: 'boolean' }, limit: LIMIT(20) }, run: MAIL.search_messages },
   awaiting_reply: { tool: 'read', desc: 'Emails you sent that nobody you wrote to has answered. Check this before saying "they never replied".',
-    args: { days: DAYS, account: MSG.account, limit: LIMIT(30) }, run: MAIL.awaiting_reply },
+    args: { days: DAYS, account: MSG.account, limit: LIMIT(20) }, run: MAIL.awaiting_reply },
   needs_response: { tool: 'read', desc: 'Inbox emails from people that wait for YOUR answer. Skips no-reply and notification senders.',
-    args: { days: DAYS, account: MSG.account, limit: LIMIT(30) }, run: MAIL.needs_response },
+    args: { days: DAYS, account: MSG.account, limit: LIMIT(20) }, run: MAIL.needs_response },
   get_thread: { tool: 'read', desc: 'The whole conversation of a message, oldest first, with your sent replies.',
     args: ext(MSG, { bodies: { type: 'boolean', 'default': true }, max_chars: { type: 'integer', 'default': 2000, min: 200, max: 20000, desc: 'per message, default 2000' }, limit: LIMIT(30) }), run: MAIL.get_thread },
   list_attachments: { tool: 'read', desc: 'Attachments of a message: name, size, type.', args: MSG, run: MAIL.list_attachments },
   read_message: { tool: 'read', desc: 'One message: headers, attachments and text (long text is paged with offset).', args: ext(MSG, PAGE), run: MAIL.read_message },
   list_rules: { tool: 'read', desc: 'Mail rules with conditions and actions.', args: {}, run: MAIL.list_rules },
   // ---- Mail: write
-  send_email: { tool: 'write', guard: true, desc: 'Send a new email. draft:true only opens it in Mail for the user to send.',
+  send_email: { tool: 'write', guard: true, desc: 'Send a new email. draft:true opens it in Mail instead; dry_run:true only shows what would be sent.',
     args: { to: { type: 'addresses', required: true, desc: 'addresses, comma separated' }, cc: { type: 'addresses' }, bcc: { type: 'addresses' },
       subject: { type: 'string', required: true }, body: { type: 'string', required: true, desc: 'plain text' },
-      from: { type: 'string', desc: 'one of your addresses; default: Mail decides' }, draft: { type: 'boolean', 'default': false } }, run: MAIL.send_email },
-  reply_message: { tool: 'write', guard: true, desc: 'Reply to a message. Opens as a draft in Mail (Mail adds recipients and the quote); draft:false sends right away.',
-    args: ext(MSG, { body: { type: 'string', required: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, draft: { type: 'boolean', 'default': true, desc: 'default true' } }), run: MAIL.reply_message },
-  forward_message: { tool: 'write', guard: true, desc: 'Forward a message with its attachments and an optional note. Opens as a draft; draft:false sends.',
-    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', desc: 'note above the forwarded text' }, draft: { type: 'boolean', 'default': true, desc: 'default true' } }), run: MAIL.forward_message },
+      from: { type: 'string', desc: 'one of your addresses; default: Mail decides' }, draft: { type: 'boolean', 'default': false }, dry_run: { type: 'boolean', 'default': false } }, run: MAIL.send_email },
+  reply_message: { tool: 'write', guard: true, desc: 'Reply (with quote). Opens as a draft in Mail; draft:false sends; dry_run:true shows recipients, subject and body first.',
+    args: ext(MSG, { body: { type: 'string', required: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.reply_message },
+  forward_message: { tool: 'write', guard: true, desc: 'Forward with attachments and an optional note. Opens as a draft; draft:false sends; dry_run:true shows it first.',
+    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', desc: 'note above the forwarded text' }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.forward_message },
   set_read: { tool: 'write', desc: 'Mark messages read (read:true) or unread (read:false).', args: ext(MANY, { read: { type: 'boolean', required: true } }), run: MAIL.set_read },
   set_flag: { tool: 'write', desc: 'Flag messages (optional color) or unflag them (flagged:false).',
     args: ext(MANY, { flagged: { type: 'boolean', 'default': true }, color: { type: 'string', values: ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'gray'], valueAliases: { grey: 'gray', violet: 'purple' } } }), run: MAIL.set_flag },
@@ -1293,6 +1383,15 @@ var ACTIONS = {
   delete_note: { tool: 'write', guard: true, desc: 'Delete a note into Recently Deleted (recoverable). Refuses where deleting would be permanent.',
     args: { id: { type: 'string', required: true } }, run: NOTES_APP.delete_note }
 };
+
+// Which app each action talks to (for logs and error hints).
+Object.keys(ACTIONS).forEach(function (n) {
+  var run = ACTIONS[n].run, has = function (o) { return Object.keys(o).some(function (k) { return o[k] === run; }); };
+  ACTIONS[n].app = has(CALENDAR) ? 'Calendar' : has(NOTES_APP) ? 'Notes' : 'Mail';
+});
+// Test hook (protocol tests only): an action that just waits, to exercise timeouts and cancellation.
+if (env('APPLE_MAIL_TEST') === '1') ACTIONS.__sleep = { tool: 'read', app: 'Test', desc: 'test only', args: { seconds: { type: 'integer', 'default': 1, max: 600 } },
+  run: function (a) { delay(a.seconds); return { slept: a.seconds }; } };
 
 // Words small models use for actions. Write actions are reached only by exact name or these aliases, never by guessing.
 var ACTION_ALIASES = {
@@ -1378,9 +1477,11 @@ function splitInput(input) { // {action, args} from whatever shape the model sen
 
 // Small models loop. A guarded write that already succeeded with the same arguments within 15 minutes is
 // refused (repeat:true overrides); a read repeated within a minute gets a note to use the earlier result.
+// A write that timed out counts as done: it may have happened, so it is not repeated blindly either.
 var DONE = [], REPEAT_WINDOW_MS = 15 * 60e3, LAST_READ = { key: null, at: 0 };
-function callPublic(tool, input) {
-  NOTES = [];
+
+// Everything about a call that needs no Apple Event: tool, action, arguments, repeat guard.
+function prepareCall(tool, input) {
   if (tool !== 'read' && tool !== 'write') fail('No tool "' + tool + '". Tools: read, write.');
   if (tool === 'write' && READ_ONLY) fail('Read-only mode is on (extension settings): changes are disabled.', 'Tell the user; only the read tool works.');
   var call = splitInput(input || {}), found = resolveAction(tool, call.action), spec = ACTIONS[found.name], args = call.args;
@@ -1388,21 +1489,29 @@ function callPublic(tool, input) {
   var repeat = args.repeat !== undefined && TRUE_WORDS.test(String(args.repeat));
   delete args.repeat;
   var a = normaliseArgs(args, spec.args, 'args', spec.tool === 'write');
-
-  var key = found.name + ' ' + stableJSON(a), now = Date.now();
-  if (spec.guard && !a.dry_run) {
+  var key = found.name + ' ' + stableJSON(a), now = Date.now(), guarded = spec.guard && !a.dry_run;
+  if (guarded) {
     DONE = DONE.filter(function (d) { return now - d.at < REPEAT_WINDOW_MS; });
     var prev = DONE.filter(function (d) { return d.key === key; })[0];
-    if (prev && !repeat) fail('This exact ' + found.name + ' call already succeeded ' + Math.max(1, Math.round((now - prev.at) / 60e3)) + ' min ago, so it was not done again.',
-      'Use the earlier result. Only if the user explicitly asked to do it again, add "repeat": true to args.');
+    if (prev && !repeat) fail('This exact ' + found.name + ' call ' + (prev.uncertain ? 'timed out' : 'already succeeded') + ' ' + Math.max(1, Math.round((now - prev.at) / 60e3)) + ' min ago, so it was not done again.',
+      prev.uncertain ? 'It may have happened: check first (e.g. the Sent folder or the calendar). Only if it did not, add "repeat": true to args.'
+        : 'Use the earlier result. Only if the user explicitly asked to do it again, add "repeat": true to args.');
   }
   if (spec.tool === 'read') {
     if (LAST_READ.key === key && now - LAST_READ.at < 60e3) note('You just made this same call. Use that result instead of calling again.');
     LAST_READ = { key: key, at: now };
   }
-  if (spec.tool === 'write') checkCancelled(); // last chance before anything changes
-  var result = spec.run(a);
-  if (spec.guard && !a.dry_run) DONE.push({ key: key, at: now });
+  return { name: found.name, spec: spec, args: args, a: a, key: key, guarded: guarded };
+}
+function remember(call, uncertain) { if (call.guarded) DONE.push({ key: call.key, at: Date.now(), uncertain: !!uncertain }); }
+
+// In-process call (tests, and the worker process): prepare, run, remember.
+function callPublic(tool, input) {
+  NOTES = [];
+  var call = prepareCall(tool, input);
+  if (call.spec.tool === 'write') checkCancelled(); // last chance before anything changes
+  var result = call.spec.run(call.a);
+  remember(call);
   return result;
 }
 function formatResult(result) {
@@ -1411,27 +1520,39 @@ function formatResult(result) {
   if (NOTES.length) out.notes = NOTES.slice();
   return JSON.stringify(out, null, 1);
 }
-function formatError(e) {
+
+// Apple Event errors in plain words. app: Mail, Calendar or Notes.
+function appleEventHint(number, text, app) {
+  var n = Number(number) || Number((/\((-\d+)\)/.exec(text || '') || [])[1]) || 0;
+  if (n === -1743 || n === -10004 || /not allowed|not authori[sz]ed/i.test(text))
+    return 'Automation permission for ' + app + ' is off: System Settings › Privacy & Security › Automation › the app that runs this MCP server › turn on ' + app + '. Then try again.';
+  if (n === -1744) return 'macOS is asking whether this app may control ' + app + ': answer that dialog on the Mac, then try again.';
+  if (n === -600) return app + ' is not running and could not be started. Open ' + app + ' once, then try again.';
+  if (n === -609) return 'The connection to ' + app + ' was lost (it quit or crashed). Open ' + app + ' again, then try again.';
+  if (n === -1712) return app + ' did not answer in time. It may be busy or showing a dialog; check ' + app + ' on the Mac, then try again.';
+  return 'Try once more; if it fails again, tell the user what failed.';
+}
+function formatError(e, app) {
   if (e instanceof UserError) return 'Error: ' + e.message + (e.hint ? '\nHow to fix: ' + e.hint : '') + (NOTES.length ? '\nNotes: ' + NOTES.join(' ') : '');
-  var text = errorText(e);
-  return 'Error from macOS: ' + text + (/not allowed|not authori[sz]ed|-1743|-10004|permission/i.test(text)
-    ? '\nThe user must allow access in System Settings → Privacy & Security → Automation.' : '\nTry once more; if it repeats, tell the user what failed.');
+  var text = errorText(e), n = e && e.errorNumber;
+  return 'Error from ' + (app || 'macOS') + (n ? ' (' + n + ')' : '') + ': ' + text + '\nHow to fix: ' + appleEventHint(n, text, app || 'the app');
 }
 
 // ---------- the two public tools ----------
-function describe(names) {
-  return names.map(function (n) {
-    var a = ACTIONS[n].args, args = Object.keys(a).map(function (k) {
-      var s = a[k];
-      return k + (s.required ? '*' : '') + ':' + (s.values ? s.values.join('|') : s.type) + (s.desc ? ' (' + s.desc + ')' : '');
-    }).join(', ');
-    return '• ' + n + ' — ' + ACTIONS[n].desc + (args ? ' Args: ' + args : '');
-  }).join('\n');
+// Compact on purpose: small local models read this on every request.
+function signature(n) {
+  var a = ACTIONS[n].args;
+  return n + '(' + Object.keys(a).map(function (k) {
+    var s = a[k], d = s['default'];
+    return k + (s.required ? '*' : '') + (s.values ? '=' + s.values.join('|') : d !== undefined && d !== false ? '=' + d : '') + (s.type === 'date' ? ':date' : s.type === 'ids' ? ':[ids]' : '');
+  }).join(', ') + ')';
 }
 function publicTool(name, title, right, wrong, annotations) {
   var names = actionsOf(name);
   return { name: name, annotations: annotations,
-    description: title + '\nCall with {"action": "<name>", "args": {…}}. * = required.\nRIGHT: ' + right + '\nWRONG: ' + wrong + ' — args go inside "args".\n' + describe(names),
+    description: title + '\nCall {"action": "<name>", "args": {…}}. *=required, =default. Copy id/account/mailbox from one result row. Dates: ISO 8601, today, tomorrow, "3 days ago".\n' +
+      'RIGHT: ' + right + '\nWRONG: ' + wrong + ' (args go inside "args")\n' +
+      names.map(function (n) { return '• ' + signature(n) + ' — ' + ACTIONS[n].desc; }).join('\n'),
     inputSchema: { type: 'object', properties: {
       action: { type: 'string', 'enum': names },
       args: { type: 'object', description: 'arguments of the chosen action' } }, required: ['action'] } };
@@ -1452,15 +1573,22 @@ var INSTRUCTIONS = 'Apple Mail, Calendar and Notes on this Mac. The read tool lo
 // ======================================================================
 // JSON-RPC
 // ======================================================================
+// The server runs as two processes. The main one speaks MCP and never sends an Apple Event, so ping and
+// tools/list always answer. A worker process (this same file, APPLE_MAIL_WORKER=1) runs the actions; a call
+// that takes longer than CALL_TIMEOUT_S is answered with an error and the worker is restarted.
 var PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']; // newest first
+var WORKER_MODE = env('APPLE_MAIL_WORKER') === '1';
+var CALL_TIMEOUT_S = Math.max(2, Number(env('APPLE_MAIL_TIMEOUT')) || 25);
+
 function handle(req) {
   var id = req.id, method = req.method, p = req.params || {};
   try {
     if (method === 'initialize') {
       var want = p.protocolVersion;
-      return send({ jsonrpc: '2.0', id: id, result: {
+      send({ jsonrpc: '2.0', id: id, result: {
         protocolVersion: PROTOCOL_VERSIONS.indexOf(want) >= 0 ? want : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} }, serverInfo: { name: 'apple-mail-jxa', version: VERSION }, instructions: INSTRUCTIONS } });
+      return Worker.warm();
     }
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: { tools: PUBLIC_TOOLS } });
     if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
@@ -1470,27 +1598,154 @@ function handle(req) {
         return send({ jsonrpc: '2.0', id: id, error: { code: -32602, message: 'Unknown tool: ' + p.name + '. Tools: ' + names.join(', ') + (READ_ONLY ? ' (read-only mode is on)' : '') } });
       if (p.arguments !== undefined && (p.arguments === null || typeof p.arguments !== 'object' || Array.isArray(p.arguments)))
         return send({ jsonrpc: '2.0', id: id, error: { code: -32602, message: 'tools/call arguments must be an object: {"action": "…", "args": {…}}' } });
-      var out;
-      try {
-        out = { content: [{ type: 'text', text: formatResult(callPublic(p.name, p.arguments)) }] };
-      } catch (e) {
-        if (e instanceof Cancelled) { log('cancelled request ' + id); return; } // a cancelled request gets no response
-        out = { isError: true, content: [{ type: 'text', text: formatError(e) }] };
-      }
-      return send({ jsonrpc: '2.0', id: id, result: out });
+      var out = toolCall(id, p.name, p.arguments);
+      if (out) send({ jsonrpc: '2.0', id: id, result: out });
+      return;
     }
     send({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Method not found: ' + method } });
   } catch (e) {
     send({ jsonrpc: '2.0', id: id, error: { code: -32603, message: errorText(e) } });
   }
 }
+function text(t, isError) { var o = { content: [{ type: 'text', text: t }] }; if (isError) o.isError = true; return o; }
+// One tools/call: prepared here, run by the worker (or in this process when there is none). null = cancelled.
+function toolCall(id, tool, input) {
+  NOTES = [];
+  var call;
+  try { call = prepareCall(tool, input); } catch (e) { return text(formatError(e), true); }
+  var app = call.spec.app, label = tool + '.' + call.name + ' [' + app + ']', t0 = Date.now(), r;
+  log('→ ' + id + ' ' + label);
+  try {
+    r = Worker.run(call.name, call.args);
+  } catch (e) {
+    if (e instanceof Cancelled) { remember(call, true); log('← ' + id + ' ' + call.name + ' cancelled after ' + (Date.now() - t0) + 'ms'); return null; }
+    throw e;
+  }
+  (r.notes || []).forEach(note);
+  var ms = Date.now() - t0;
+  if (r.timeout || r.died) { // the outcome is unknown: a write may have happened
+    remember(call, true);
+    log('← ' + id + ' ' + call.name + (r.timeout ? ' TIMEOUT' : ' WORKER DIED') + ' after ' + ms + 'ms');
+    return text('Error: ' + (r.timeout ? app + ' did not answer within ' + CALL_TIMEOUT_S + ' s, so the call was stopped.' : 'The process talking to ' + app + ' ended before it answered.') +
+      '\nHow to fix: ' + app + ' may be busy, showing a dialog, or waiting for an Automation permission prompt — check it on the Mac.' +
+      (call.spec.tool === 'write' ? ' The change may or may not have happened: check (e.g. the Sent folder) before trying again.' : ' Then try again, perhaps with a smaller limit or a narrower search.'), true);
+  }
+  log('← ' + id + ' ' + call.name + ' ' + ms + 'ms ' + (r.error ? 'error' + (r.error.number ? ' ' + r.error.number : '') : 'ok'));
+  if (r.error) {
+    var err = r.error.user ? new UserError(r.error.message, r.error.hint) : { message: r.error.message, errorNumber: r.error.number };
+    return text(formatError(err, app), true);
+  }
+  remember(call);
+  return text(formatResult(r.value));
+}
+
+// ---------- the worker process ----------
+var Worker = {
+  task: null, input: null, buf: null, replies: [], dead: false, path: null, observer: null,
+  selfPath: function () {
+    if (this.path !== null) return this.path;
+    var args = safe(function () { return ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments); }, []) || [];
+    this.path = args.filter(function (x) { return /\.js$/.test(x); }).pop() || '';
+    return this.path;
+  },
+  usable: function () { return !WORKER_MODE && env('APPLE_MAIL_NO_WORKER') !== '1' && !!this.selfPath(); },
+  start: function () {
+    var t = $.NSTask.alloc.init, envd = $.NSMutableDictionary.dictionaryWithDictionary($.NSProcessInfo.processInfo.environment);
+    envd.setObjectForKey($('1'), $('APPLE_MAIL_WORKER'));
+    t.launchPath = '/usr/bin/osascript';
+    t.arguments = $(['-l', 'JavaScript', this.selfPath()]);
+    t.environment = envd;
+    var inPipe = $.NSPipe.pipe, outPipe = $.NSPipe.pipe;
+    t.standardInput = inPipe; t.standardOutput = outPipe; // stderr is shared, so worker logs reach the client too
+    var out = outPipe.fileHandleForReading;
+    this.observer = $.AppleMailMCPWorkerOut.alloc.init;
+    $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(this.observer, 'onData:', $.NSFileHandleReadCompletionNotification, out);
+    out.readInBackgroundAndNotify;
+    t.launch;
+    this.task = t; this.input = inPipe.fileHandleForWriting; this.buf = $.NSMutableData.alloc.init; this.replies = []; this.dead = false;
+    log('worker started (pid ' + t.processIdentifier + ')');
+  },
+  stop: function () {
+    if (this.observer) { $.NSNotificationCenter.defaultCenter.removeObserver(this.observer); this.observer = null; }
+    if (this.task) { safe(function () { Worker.task.terminate; }); log('worker stopped'); }
+    this.task = null; this.input = null;
+  },
+  warm: function () { if (this.usable() && !this.task) safe(function () { Worker.start(); }); },
+  onData: function (d) {
+    if (!d || Number(d.length) === 0) { this.dead = true; return false; }
+    this.buf.appendData(d);
+    var str = $.NSString.alloc.initWithDataEncoding(this.buf, $.NSUTF8StringEncoding);
+    if (str && !str.isNil()) {
+      str = str.js;
+      var nl = str.lastIndexOf('\n');
+      if (nl >= 0) {
+        var rest = str.slice(nl + 1);
+        this.buf = $.NSMutableData.alloc.init;
+        if (rest.length) this.buf.appendData($(rest).dataUsingEncoding($.NSUTF8StringEncoding));
+        str.slice(0, nl).split('\n').forEach(function (l) { if (l.trim()) Worker.replies.push(safe(function () { return JSON.parse(l); }, { error: { message: 'bad reply from worker' } })); });
+      }
+    }
+    return true;
+  },
+  // → {value, notes} | {error: {message, hint, user, number}, notes} | {timeout: true}. Throws Cancelled.
+  run: function (name, args) {
+    if (!this.usable()) return runAction(name, args);
+    if (!this.task || this.dead || !this.task.isRunning) { this.stop(); this.start(); }
+    var line = JSON.stringify({ action: name, args: args }, function (k, v) { return v; }) + '\n';
+    try { this.input.writeData($(line).dataUsingEncoding($.NSUTF8StringEncoding)); } catch (e) {
+      this.stop(); this.start(); this.input.writeData($(line).dataUsingEncoding($.NSUTF8StringEncoding));
+    }
+    var deadline = Date.now() + CALL_TIMEOUT_S * 1000;
+    while (!this.replies.length) {
+      pump(0.05);
+      serveWhileBusy();
+      if (CURRENT && CANCELLED[CURRENT.key]) { this.stop(); throw new Cancelled(); }
+      if (this.dead) { this.stop(); return { died: true }; }
+      if (Date.now() > deadline) { this.stop(); return { timeout: true }; }
+    }
+    return this.replies.shift();
+  }
+};
+// Run one action here and report it as data (used by the worker, or in-process without one).
+function runAction(name, rawArgs) {
+  NOTES = [];
+  try {
+    var spec = ACTIONS[name];
+    var a = normaliseArgs(rawArgs, spec.args, 'args', spec.tool === 'write');
+    var value = spec.run(a);
+    return { value: value, notes: NOTES.slice() };
+  } catch (e) {
+    if (e instanceof Cancelled) throw e;
+    return { notes: NOTES.slice(), error: e instanceof UserError ? { user: true, message: e.message, hint: e.hint }
+      : { message: errorText(e), number: (e && e.errorNumber) || null } };
+  }
+}
+function workerLoop() { // one JSON request per line on stdin, one reply per line on stdout
+  var stdin = $.NSFileHandle.fileHandleWithStandardInput, bytes = $.NSMutableData.alloc.init, buf = '';
+  while (true) {
+    var chunk = stdin.availableData;
+    if (!chunk || Number(chunk.length) === 0) break;
+    bytes.appendData(chunk);
+    var str = $.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding);
+    if (!str || str.isNil()) continue; // a character split between chunks: wait for the rest
+    buf += str.js; bytes = $.NSMutableData.alloc.init;
+    var nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      var line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      var req = safe(function () { return JSON.parse(line); }, null), reply;
+      if (!req || !ACTIONS[req.action]) reply = { error: { message: 'unknown worker request' } };
+      else reply = runAction(req.action, req.args || {});
+      send(reply);
+    }
+  }
+}
 
 // ---------- stdio with cancellation ----------
-// Handlers are synchronous Apple Events. stdin is read in the background (run loop notifications), so a
-// cancellation that arrives while one request runs is seen before the next starts, and at the
-// checkpoints right before anything irreversible (checkCancelled()).
+// stdin is read in the background (run loop notifications). While the worker runs a call, other requests
+// (ping, tools/list, …) are answered right away and a cancellation of the running call stops the worker.
 function Cancelled() {}
-var QUEUE = [], CANCELLED = Object.create(null), CURRENT = null, EOF = false;
+var QUEUE = [], CANCELLED = Object.create(null), CURRENT = null, EOF = false, STDIN_OBSERVER = null;
 var inBuf = $.NSMutableData.alloc.init;
 function idKey(id) { return typeof id + ':' + String(id); }
 function isRequestId(id) { return typeof id === 'string' || (typeof id === 'number' && isFinite(id)); }
@@ -1509,6 +1764,14 @@ function onMessage(msg) {
     return;
   }
   QUEUE.push({ key: idKey(msg.id), msg: msg });
+}
+function serveWhileBusy() { // answer everything but tool calls while a tool call runs
+  for (var i = 0; i < QUEUE.length; i++) {
+    var r = QUEUE[i];
+    if (r.msg.method === 'tools/call') continue;
+    QUEUE.splice(i--, 1);
+    handle(r.msg);
+  }
 }
 function onChunk(data) {
   inBuf.appendData(data);
@@ -1534,16 +1797,24 @@ ObjC.registerSubclass({ name: 'AppleMailMCPStdin', methods: { 'onData:': { types
   try { onChunk(d); } catch (e) { log('input error: ' + errorText(e)); }
   n.object.readInBackgroundAndNotify;
 } } } });
+ObjC.registerSubclass({ name: 'AppleMailMCPWorkerOut', methods: { 'onData:': { types: ['void', ['id']], implementation: function (n) {
+  if (Worker.onData(n.userInfo.objectForKey($.NSFileHandleNotificationDataItem))) n.object.readInBackgroundAndNotify;
+} } } });
 function pump(seconds) { $.NSRunLoop.currentRunLoop.runModeBeforeDate($.NSDefaultRunLoopMode, $.NSDate.dateWithTimeIntervalSinceNow(seconds)); }
 function checkCancelled() {
+  if (WORKER_MODE) return; // the main process stops the worker instead
   pump(0);
   if (CURRENT && CANCELLED[CURRENT.key]) throw new Cancelled();
 }
 function run() {
+  ObjC.import('signal');
+  $.signal(13, 1); // SIGPIPE ignored: writing to a closed pipe throws instead of killing the process
+  if (WORKER_MODE) return workerLoop();
   var stdin = $.NSFileHandle.fileHandleWithStandardInput;
-  $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject($.AppleMailMCPStdin.alloc.init, 'onData:', $.NSFileHandleReadCompletionNotification, stdin);
+  STDIN_OBSERVER = $.AppleMailMCPStdin.alloc.init; // kept: the notification center does not retain observers
+  $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(STDIN_OBSERVER, 'onData:', $.NSFileHandleReadCompletionNotification, stdin);
   stdin.readInBackgroundAndNotify;
-  log('started ' + VERSION + (READ_ONLY ? ' (read-only)' : ''));
+  log('started ' + VERSION + (READ_ONLY ? ' (read-only)' : '') + ', timeout ' + CALL_TIMEOUT_S + ' s' + (Worker.usable() ? '' : ', no worker'));
   while (true) {
     if (!QUEUE.length) { if (EOF) break; pump(60); continue; }
     pump(0); // cancellations that arrived while the previous request ran
@@ -1552,5 +1823,6 @@ function run() {
     CURRENT = r;
     try { handle(r.msg); } finally { delete CANCELLED[r.key]; CURRENT = null; }
   }
+  Worker.stop();
   log('stdin closed, exiting');
 }

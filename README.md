@@ -122,7 +122,8 @@ As environment variables in the server's `env` (Claude Desktop: **Settings → E
 | --- | --- |
 | `APPLE_MAIL_READ_ONLY=true` | Removes the `write` tool entirely. The assistant can read and search, but can't send, move, delete or create anything. A good default for a shared or work machine. |
 | `APPLE_MAIL_DEFAULT_ACCOUNT` | Used when the assistant doesn't name an account, e.g. `Work`. |
-| `APPLE_MAIL_SAVE_DIR` | Where saved attachments go. Defaults to `~/Downloads`. |
+| `APPLE_MAIL_SAVE_DIR` | Where saved attachments go. Defaults to `~/Downloads`; `~` and `${HOME}` are expanded. |
+| `APPLE_MAIL_TIMEOUT` | Seconds one call may take before it is stopped (default 25). |
 
 ### Tool permissions
 
@@ -132,7 +133,9 @@ Most clients ask before using a tool. We recommend allowing `read` once and appr
 
 - **Mail and notes are never deleted for good.** Mail goes to the account's Trash, notes go to Recently Deleted. Where that isn't possible — an account without a Trash folder, a Notes account without Recently Deleted (e.g. Exchange), something already in the trash, a locked note — the extension refuses and says why. Mail rules that delete are only allowed when every account keeps deleted mail in its Trash.
 - **Calendar events and rules have no trash in macOS.** Deleting one returns a full copy of it, so it can be recreated on request.
-- **Replies and forwards are drafts by default.** Mail fills in their recipients and quote, so you see the real thing in Mail and press *Send* yourself.
+- **Replies and forwards are drafts by default.** You see the real thing in Mail and press *Send* yourself. `dry_run: true` shows exactly what would go out — recipients (Reply-To and reply-all included), subject and the full text — and a reply is not sent if Mail would address it differently. Results of a send list what Mail actually sent.
+- **Nothing hangs.** Mail, Calendar and Notes are driven from a separate worker process: a call that takes longer than the timeout is stopped with a clear error, `ping` and `tools/list` always answer, and a cancelled call really stops. A write that timed out is not repeated blindly. Each call is logged to stderr with its app and duration.
+- **Permissions explained.** A missing Automation permission, an app that is not running or a lost connection comes back as a plain "how to fix" instead of an error code.
 - **No accidental repeats.** The same send, reply, delete or create call twice within 15 minutes is refused — a stuck model can't send an email five times.
 - **Repeating events are deleted only on purpose.** Deleting one removes the whole series, so the extension asks for `whole_series: true`.
 - **Dry runs.** Bulk moves and deletes can be previewed before they happen.
