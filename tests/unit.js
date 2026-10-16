@@ -617,6 +617,10 @@ function run(argv) {
     has(callErr('write', { action: 'reply_message', args: { id: m.id(), body: 'ok', draft: false } }), 'Nothing was sent');
     eq(Mail.sent.length, 0);
   });
+  test('email and note bodies are kept byte for byte', function () {
+    var r = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 'Code', body: '    indented code\nend\n', dry_run: true } });
+    eq(r.would_send.body, '    indented code\nend\n');
+  });
   test('send results show what Mail has: from, recipients, subject, size, time', function () {
     var r = call('write', { action: 'send_email', args: { to: 'b@example.com', cc: 'c@example.com', subject: 'Hi', body: 'hello' } });
     eq(r.status, 'Sent.'); eq(r.to, ['b@example.com']); eq(r.cc, ['c@example.com']); eq(r.body_chars, 5); ok(r.sent_at);

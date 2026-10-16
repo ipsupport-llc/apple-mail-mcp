@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.5.1'; // release.yml rewrites this from the tag
+var VERSION = '1.5.2'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -187,7 +187,7 @@ function coerce(v, spec, key, strict) {
     case 'string': {
       if (typeof v === 'number' || typeof v === 'boolean') v = String(v);
       if (typeof v !== 'string') bad('text');
-      var s = trim(v);
+      var s = spec.raw ? v : trim(v); // content (raw) is kept byte for byte; names and ids are trimmed
       if (!spec.values) return s;
       var hit = pickName(s, spec.values) || (spec.valueAliases || {})[lower(s)] || (spec.valueAliases || {})[snake(s)];
       if (!hit && !strict) { var c = closest(s, spec.values); if (c.length) { hit = c[0]; note('Read ' + key + ' "' + s + '" as "' + hit + '".'); } }
@@ -1360,12 +1360,12 @@ var ACTIONS = {
   // ---- Mail: write
   send_email: { tool: 'write', guard: true, desc: 'Send a new email. draft:true opens it in Mail instead; dry_run:true only shows what would be sent.',
     args: { to: { type: 'addresses', required: true, desc: 'addresses, comma separated' }, cc: { type: 'addresses' }, bcc: { type: 'addresses' },
-      subject: { type: 'string', required: true }, body: { type: 'string', required: true, desc: 'plain text' },
+      subject: { type: 'string', required: true }, body: { type: 'string', required: true, raw: true, desc: 'plain text' },
       from: { type: 'string', desc: 'one of your addresses; default: Mail decides' }, draft: { type: 'boolean', 'default': false }, dry_run: { type: 'boolean', 'default': false } }, run: MAIL.send_email },
   reply_message: { tool: 'write', guard: true, desc: 'Reply (with quote). Opens as a draft in Mail; draft:false sends; dry_run:true shows recipients, subject and body first.',
-    args: ext(MSG, { body: { type: 'string', required: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.reply_message },
+    args: ext(MSG, { body: { type: 'string', required: true, raw: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.reply_message },
   forward_message: { tool: 'write', guard: true, desc: 'Forward with attachments and an optional note. Opens as a draft; draft:false sends; dry_run:true shows it first.',
-    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', desc: 'note above the forwarded text' }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.forward_message },
+    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', raw: true, desc: 'note above the forwarded text' }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.forward_message },
   set_read: { tool: 'write', desc: 'Mark messages read (read:true) or unread (read:false).', args: ext(MANY, { read: { type: 'boolean', required: true } }), run: MAIL.set_read },
   set_flag: { tool: 'write', desc: 'Flag messages (optional color) or unflag them (flagged:false).',
     args: ext(MANY, { flagged: { type: 'boolean', 'default': true }, color: { type: 'string', values: ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'gray'], valueAliases: { grey: 'gray', violet: 'purple' } } }), run: MAIL.set_flag },
@@ -1398,7 +1398,7 @@ var ACTIONS = {
   create_event: { tool: 'write', guard: true, desc: 'Create an event. start/end: ISO 8601 with time zone, e.g. 2026-10-27T13:00:00-06:00. A date alone makes an all-day event.',
     args: { title: { type: 'string', required: true }, start: { type: 'date', required: true, aliases: ['from', 'date', 'when', 'start_date', 'on'] }, end: { type: 'date', desc: 'default: 1 hour after start', aliases: ['to', 'end_date', 'until'] },
       all_day: { type: 'boolean' }, calendar: { type: 'string', desc: 'needed when several calendars are writable' }, calendar_index: { type: 'integer', min: 0 },
-      location: { type: 'string' }, notes: { type: 'string' }, recurrence: { type: 'string', desc: 'iCalendar RRULE, e.g. FREQ=WEEKLY;BYDAY=MO' } }, run: CALENDAR.create_event },
+      location: { type: 'string' }, notes: { type: 'string', raw: true }, recurrence: { type: 'string', desc: 'iCalendar RRULE, e.g. FREQ=WEEKLY;BYDAY=MO' } }, run: CALENDAR.create_event },
   delete_event: { tool: 'write', guard: true, desc: 'Delete an event by uid (from list_events). Permanent in Calendar; the result holds a copy. A repeating event needs whole_series:true.',
     args: { uid: { type: 'string', required: true, aliases: ['id'] }, calendar: { type: 'string' }, calendar_index: { type: 'integer', min: 0 }, whole_series: { type: 'boolean', 'default': false } }, run: CALENDAR.delete_event },
   // ---- Notes
@@ -1410,9 +1410,9 @@ var ACTIONS = {
   read_note: { tool: 'read', desc: 'A note as plain text (html:true for HTML). Long notes are paged with offset.',
     args: ext({ id: { type: 'string', required: true, desc: 'note id from list_notes / search_notes' }, html: { type: 'boolean', 'default': false } }, PAGE), run: NOTES_APP.read_note },
   create_note: { tool: 'write', guard: true, desc: 'Create a note. body is plain text (lines kept) unless html:true.',
-    args: { title: { type: 'string', required: true }, body: { type: 'string' }, html: { type: 'boolean', 'default': false }, folder: { type: 'string', desc: 'default: the account\'s default folder' }, account: { type: 'string' } }, run: NOTES_APP.create_note },
+    args: { title: { type: 'string', required: true }, body: { type: 'string', raw: true }, html: { type: 'boolean', 'default': false }, folder: { type: 'string', desc: 'default: the account\'s default folder' }, account: { type: 'string' } }, run: NOTES_APP.create_note },
   update_note: { tool: 'write', guard: true, desc: 'Change a note: append:true adds text at the end, otherwise the body is replaced (title kept unless given).',
-    args: { id: { type: 'string', required: true }, body: { type: 'string', required: true }, html: { type: 'boolean', 'default': false }, append: { type: 'boolean', 'default': false }, title: { type: 'string' } }, run: NOTES_APP.update_note },
+    args: { id: { type: 'string', required: true }, body: { type: 'string', required: true, raw: true }, html: { type: 'boolean', 'default': false }, append: { type: 'boolean', 'default': false }, title: { type: 'string' } }, run: NOTES_APP.update_note },
   delete_note: { tool: 'write', guard: true, desc: 'Delete a note into Recently Deleted (recoverable). Refuses where deleting would be permanent.',
     args: { id: { type: 'string', required: true } }, run: NOTES_APP.delete_note }
 };
