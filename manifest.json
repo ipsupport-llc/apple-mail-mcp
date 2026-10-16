@@ -3,7 +3,7 @@
   "name": "apple-mail-mcp",
   "display_name": "Apple Mail, Calendar & Notes",
   "version": "1.4.0",
-  "description": "Apple Mail, Calendar and Notes for Claude — read, search, triage and send, locally, with zero dependencies.",
+  "description": "Apple Mail, Calendar and Notes for your AI assistant — read, search, triage and send, locally, with zero dependencies.",
   "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS: no Node, Python or Homebrew. Two tools — `read` (never changes anything) and `write` (send, reply, forward, organize, rules, events, notes) — so you approve permissions twice, not thirty times. Finds emails waiting for your reply and sent emails nobody answered.",
   "author": {
     "name": "IPSupport LLC",
@@ -45,14 +45,14 @@
     "read_only": {
       "type": "boolean",
       "title": "Read-only mode",
-      "description": "Hide the write tool: Claude can read and search but never send, move, delete or create anything.",
+      "description": "Hide the write tool: the assistant can read and search but never send, move, delete or create anything.",
       "default": false,
       "required": false
     },
     "default_account": {
       "type": "string",
       "title": "Default Mail account",
-      "description": "Account name as shown in Apple Mail (e.g. Work). Used when Claude doesn't name one.",
+      "description": "Account name as shown in Apple Mail (e.g. Work). Used when the assistant doesn't name one.",
       "default": "",
       "required": false
     },

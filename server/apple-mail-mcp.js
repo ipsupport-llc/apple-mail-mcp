@@ -21,7 +21,7 @@ function send(obj) {
 }
 function log(s) { console.log('[apple-mail-mcp] ' + s); } // stderr
 
-// ---------- config (Claude Desktop extension settings → env) ----------
+// ---------- config (env from the MCP client; the .mcpb maps its extension settings to these) ----------
 function env(k) {
   try {
     var v = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey(k));

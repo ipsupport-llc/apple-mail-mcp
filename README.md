@@ -2,17 +2,17 @@
   <img src="icon.png" width="96" alt="">
 </p>
 
-<h1 align="center">Apple Mail, Calendar & Notes for Claude</h1>
+<h1 align="center">Apple Mail, Calendar & Notes MCP</h1>
 
 <p align="center">
-  Let Claude Desktop read, search, triage and send your mail, manage your calendar and keep notes —<br>
-  using the Mail, Calendar and Notes apps already on your Mac.
+  Let your AI assistant read, search, triage and send your mail, manage your calendar and keep notes —<br>
+  using the Mail, Calendar and Notes apps already on your Mac. Works with any MCP client.
 </p>
 
 <p align="center">
   <a href="../../releases/latest"><b>Download the latest release</b></a> ·
   <a href="#install">Install</a> ·
-  <a href="#what-claude-can-do">What it can do</a> ·
+  <a href="#what-it-can-do">What it can do</a> ·
   <a href="#faq">FAQ</a>
 </p>
 
@@ -20,17 +20,18 @@
 
 ## Why this exists
 
-Most Claude connectors live in the cloud and only work with Gmail or Outlook. If your mail lives in **Apple Mail** — a self-hosted IMAP server, iCloud, a company account — there was no clean way to give Claude access.
+Most AI mail connectors live in the cloud and only work with Gmail or Outlook. If your mail lives in **Apple Mail** — a self-hosted IMAP server, iCloud, a company account — there was no clean way to give an assistant access.
 
-This extension talks to the apps on your Mac directly. That means:
+This [MCP](https://modelcontextprotocol.io) server talks to the apps on your Mac directly. That means:
 
-- **Any account Apple Mail can open works.** Self-hosted, iCloud, Exchange, Gmail-via-IMAP — if it's in Mail.app, Claude can see it.
+- **Any MCP client.** Desktop chat apps, local-model apps, coding agents — anything that can start an MCP server over stdio.
+- **Any account Apple Mail can open works.** Self-hosted, iCloud, Exchange, Gmail-via-IMAP — if it's in Mail.app, your assistant can see it.
 - **Nothing to install.** No Node, no Python, no Homebrew. It runs on JavaScript for Automation, which ships with every Mac.
-- **Your mail stays on your Mac.** The extension has no network code. Claude only sees what it asks for.
+- **Your mail stays on your Mac.** The server has no network code. The assistant only sees what it asks for; where that goes next depends on your model (a local model keeps everything on the Mac).
 - **Two permission prompts, not thirty.** Everything is grouped into a `read` tool and a `write` tool. Approve `read` once and forget about it.
 - **Works with small local models too.** Arguments are forgiving (`"true"`, `"3 days ago"`, `folder` instead of `mailbox`), and every mistake comes back with a plain "how to fix" line instead of a dead end.
 
-## What Claude can do
+## What it can do
 
 Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer invoice to accounting"*, *"put a call with Sam on Tuesday at 1pm"*, *"save the PDFs from the contract email"*. Under the hood:
 
@@ -41,7 +42,7 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 | **Needs response** | Emails from real people you haven't answered yet. Ignores no-reply senders and notifications. |
 | **Awaiting reply** | Emails *you* sent that none of the recipients has answered. Great for follow-ups. |
 | **Conversation view** | A whole thread in order — their messages and your replies — from every folder, including Sent. Messages count as one conversation only when the subject *and* the people match. |
-| **Replied / forwarded / flagged** | Every message in a list shows whether you already replied, so Claude doesn't nag you twice. |
+| **Replied / forwarded / flagged** | Every message in a list shows whether you already replied, so the assistant doesn't nag you twice. |
 
 ### 🔎 Read & search
 
@@ -85,27 +86,47 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 
 ## Install
 
-You need macOS and [Claude Desktop](https://claude.ai/download).
+You need macOS 14 or later (older versions will likely work but aren't tested) and an MCP client.
+
+### Any MCP client
+
+Get the code — `git clone https://github.com/ipsupport-llc/apple-mail-mcp`, or unzip the `.mcpb` from the [latest release](../../releases/latest) — and add the server to your client's config. It runs on the Mac's own `osascript`:
+
+```json
+{
+  "mcpServers": {
+    "apple-mail": {
+      "command": "/usr/bin/osascript",
+      "args": ["-l", "JavaScript", "/path/to/apple-mail-mcp/server/apple-mail-mcp.js"]
+    }
+  }
+}
+```
+
+`./install.sh --print` prints this block with the right path. The server is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.ipsupport-llc/apple-mail-mcp`.
+
+The first time the assistant touches Mail, Calendar or Notes, macOS asks whether your client may control them — click **Allow**.
+
+### Claude Desktop (one click)
 
 1. Download **`apple-mail-mcp.mcpb`** from the [latest release](../../releases/latest).
-2. Double-click it. Claude shows the extension — click **Install**.
-3. The first time Claude touches Mail, Calendar or Notes, macOS asks for permission — click **Allow**.
+2. Double-click it and click **Install**.
 
-That's it. Updates and removal live in **Claude → Settings → Extensions**.
+Updates, settings and removal live in **Settings → Extensions**.
 
 ### Settings
 
-Open **Settings → Extensions → Apple Mail, Calendar & Notes → Configure**:
+As environment variables in the server's `env` (Claude Desktop: **Settings → Extensions → Apple Mail, Calendar & Notes → Configure**):
 
-| Setting | What it does |
+| Variable | What it does |
 | --- | --- |
-| **Read-only mode** | Removes the `write` tool entirely. Claude can read and search, but can't send, move, delete or create anything. A good default for a shared or work machine. |
-| **Default Mail account** | Used when Claude doesn't name an account, e.g. `Work`. |
-| **Attachments folder** | Where saved attachments go. Defaults to `~/Downloads`. |
+| `APPLE_MAIL_READ_ONLY=true` | Removes the `write` tool entirely. The assistant can read and search, but can't send, move, delete or create anything. A good default for a shared or work machine. |
+| `APPLE_MAIL_DEFAULT_ACCOUNT` | Used when the assistant doesn't name an account, e.g. `Work`. |
+| `APPLE_MAIL_SAVE_DIR` | Where saved attachments go. Defaults to `~/Downloads`. |
 
-### Permissions in Claude
+### Tool permissions
 
-Claude asks before using each tool. We recommend **Allow for all tasks** on `read`, and **Allow for this task** on `write`, so you always see what gets sent, moved or deleted.
+Most clients ask before using a tool. We recommend allowing `read` once and approving `write` each time, so you always see what gets sent, moved or deleted.
 
 ## Safety
 
@@ -116,25 +137,25 @@ Claude asks before using each tool. We recommend **Allow for all tasks** on `rea
 - **Repeating events are deleted only on purpose.** Deleting one removes the whole series, so the extension asks for `whole_series: true`.
 - **Dry runs.** Bulk moves and deletes can be previewed before they happen.
 - **Attachments stay in one place.** They are saved only inside the attachments folder from the settings and are never overwritten — an existing file gets `(1)`, `(2)`… appended.
-- **Watch out for instructions hidden in emails.** Anything Claude reads becomes part of its context, and a malicious email could try to tell it to do something. Keep `write` on manual approval, or turn on read-only mode, if that worries you.
+- **Watch out for instructions hidden in emails.** Anything the assistant reads becomes part of its context, and a malicious email could try to tell it to do something. Keep `write` on manual approval, or turn on read-only mode, if that worries you.
 - **One readable file.** The whole server is [`server/apple-mail-mcp.js`](server/apple-mail-mcp.js), with no dependencies and no network calls.
 
 ## FAQ
 
 **Do Mail rules run when my Mac is asleep?**
-No. Apple Mail rules only run while Mail is open, and only on new mail. To sort old mail, ask Claude to move it. If your mail server supports Sieve, server-side filters are more reliable across devices.
+No. Apple Mail rules only run while Mail is open, and only on new mail. To sort old mail, ask the assistant to move it. If your mail server supports Sieve, server-side filters are more reliable across devices.
 
-**Claude can't read a note.**
+**The assistant can't read a note.**
 It's probably locked. Unlock it in Notes first; locked notes stay private.
 
 **Search is slow.**
 Apple Mail's scripting is slow on very large folders, and searching message text is the slowest. Narrow it to an account, a folder or a date range.
 
 **The tools don't show up.**
-Check **Settings → Extensions** that the extension is enabled, then toggle it off and on. Logs are in `~/Library/Logs/Claude/` (`mcp-server-*.log`).
+Check that the server is enabled in your client, then restart the client. `./test.sh` talks to the server directly, without any client. (Claude Desktop: **Settings → Extensions**; logs in `~/Library/Logs/Claude/`.)
 
 **"Not authorized to send Apple events".**
-Open **System Settings → Privacy & Security → Automation** and allow Claude to control Mail, Calendar and Notes.
+Open **System Settings → Privacy & Security → Automation** and allow your MCP client (the app that starts the server) to control Mail, Calendar and Notes.
 
 ---
 
@@ -194,14 +215,15 @@ Run the server straight from a checkout instead of the `.mcpb`:
 ```sh
 git clone https://github.com/ipsupport-llc/apple-mail-mcp.git ~/code/apple-mail-mcp
 cd ~/code/apple-mail-mcp
-./install.sh     # adds an "apple-mail" entry to claude_desktop_config.json (backs it up first)
+./install.sh --print   # any client: prints the config block to paste
+./install.sh     # Claude Desktop: adds an "apple-mail" entry to claude_desktop_config.json (backs it up first)
 ./test.sh        # talks to the server directly and prints your accounts and calendars
 ./uninstall.sh   # removes the entry
 ```
 
 `install.sh` takes the same settings as the extension: `--read-only` / `--no-read-only`, `--account Work`, `--save-dir ~/Documents/Attachments`. Running it again keeps earlier settings unless you change them (`--reset` forgets them).
 
-Restart Claude after `install.sh`. Don't use the manual install and the `.mcpb` at the same time.
+Restart Claude Desktop after `install.sh`. Don't use the manual install and the `.mcpb` at the same time.
 
 **Tests** never touch your mail: unit tests run the server against fake Mail, Calendar and Notes apps, protocol tests only speak JSON-RPC. CI runs both on macOS for every pull request.
 
@@ -210,7 +232,7 @@ Restart Claude after `install.sh`. Don't use the manual install and the `.mcpb` 
 python3 tests/protocol.py
 ```
 
-**Releasing:** push a tag and GitHub Actions validates the manifest, builds the `.mcpb` and attaches it to a release.
+**Releasing:** push a tag and GitHub Actions runs the tests, builds the `.mcpb`, attaches it to a release and lists it in the MCP Registry.
 
 ```sh
 git tag v1.4.0 && git push origin v1.4.0

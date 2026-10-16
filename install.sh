@@ -1,14 +1,16 @@
 #!/bin/bash
 # Registers apple-mail-mcp in Claude Desktop's config. Safe to re-run.
+# For any other MCP client: ./install.sh --print shows the config block to paste.
 # Options (the same settings as the .mcpb extension). Settings from an earlier install are kept
 # unless an option changes them:
 #   --read-only / --no-read-only   hide / show the write tool
 #   --account NAME                 default Mail account ("" clears it)
 #   --save-dir DIR                 attachments folder, default ~/Downloads ("" clears it)
 #   --reset                        forget all earlier settings
+#   --print                        only print the config block for another MCP client
 set -euo pipefail
 
-READ_ONLY="-"; ACCOUNT="-"; SAVE_DIR="-"; RESET=""   # "-" = keep what is there
+READ_ONLY="-"; ACCOUNT="-"; SAVE_DIR="-"; RESET=""; PRINT=""   # "-" = keep what is there
 while [ $# -gt 0 ]; do
   case "$1" in
     --read-only) READ_ONLY="true"; shift ;;
@@ -16,7 +18,8 @@ while [ $# -gt 0 ]; do
     --account) [ $# -ge 2 ] || { echo "--account needs a name"; exit 1; }; ACCOUNT="$2"; shift 2 ;;
     --save-dir) [ $# -ge 2 ] || { echo "--save-dir needs a folder"; exit 1; }; SAVE_DIR="$2"; shift 2 ;;
     --reset) RESET="1"; shift ;;
-    -h|--help) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --print) PRINT="1"; shift ;;
+    -h|--help) sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
@@ -25,6 +28,21 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER="$DIR/server/apple-mail-mcp.js"
 CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 [ -f "$SERVER" ] || { echo "server/apple-mail-mcp.js not found"; exit 1; }
+
+if [ -n "$PRINT" ]; then # config block for any MCP client; nothing is written
+  SERVER="$SERVER" READ_ONLY="$READ_ONLY" ACCOUNT="$ACCOUNT" SAVE_DIR="$SAVE_DIR" /usr/bin/osascript -l JavaScript - <<'JS'
+ObjC.import('Foundation');
+function env(k) { var v = $.NSProcessInfo.processInfo.environment.objectForKey(k); return v.isNil() ? '' : ObjC.unwrap(v); }
+var e = {};
+if (env('READ_ONLY') && env('READ_ONLY') !== '-') e.APPLE_MAIL_READ_ONLY = 'true';
+if (env('ACCOUNT') && env('ACCOUNT') !== '-') e.APPLE_MAIL_DEFAULT_ACCOUNT = env('ACCOUNT');
+if (env('SAVE_DIR') && env('SAVE_DIR') !== '-') e.APPLE_MAIL_SAVE_DIR = env('SAVE_DIR');
+var server = { command: '/usr/bin/osascript', args: ['-l', 'JavaScript', env('SERVER')] };
+if (Object.keys(e).length) server.env = e;
+JSON.stringify({ mcpServers: { 'apple-mail': server } }, null, 2);
+JS
+  exit 0
+fi
 mkdir -p "$(dirname "$CFG")"
 
 BAK=""

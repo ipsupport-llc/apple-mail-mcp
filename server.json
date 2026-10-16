@@ -2,11 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.ipsupport-llc/apple-mail-mcp",
   "title": "Apple Mail, Calendar & Notes",
-  "description": "Apple Mail, Calendar and Notes on macOS: read, search, triage and send mail, events and notes. Local, no dependencies.",
+  "description": "Apple Mail, Calendar and Notes on macOS for any MCP client. Local, no dependencies.",
   "repository": {
     "url": "https://github.com/ipsupport-llc/apple-mail-mcp",
     "source": "github"
   },
+  "websiteUrl": "https://github.com/ipsupport-llc/apple-mail-mcp",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/ipsupport-llc/apple-mail-mcp/main/icon.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
   "version": "0.0.0",
   "packages": [
     {
@@ -15,7 +23,12 @@
       "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        { "name": "APPLE_MAIL_READ_ONLY", "description": "true hides the write tool: read and search only", "format": "boolean", "isRequired": false, "isSecret": false },
+        { "name": "APPLE_MAIL_DEFAULT_ACCOUNT", "description": "Mail account used when none is named, e.g. Work", "format": "string", "isRequired": false, "isSecret": false },
+        { "name": "APPLE_MAIL_SAVE_DIR", "description": "Folder for saved attachments (default ~/Downloads)", "format": "filepath", "isRequired": false, "isSecret": false }
+      ]
     }
   ]
 }
