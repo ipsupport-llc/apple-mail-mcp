@@ -671,6 +671,26 @@ function run(argv) {
     has(call('read', { action: 'search_messages', args: { account: 'iCloud', has_attachments: true, limit: 1 } }).notes.join(' '), 'Stopped after checking 300');
   });
 
+  test('needs_response says why: never replied, wrote again, invitation; replies in another conversation count', function () {
+    var inbox = Mail.box('iCloud', 'INBOX'), sent = Mail.box('iCloud', 'Sent Messages'), d = function (days) { return new Date(Date.now() - days * 864e5); };
+    sent.add({ subject: 'Plan', to: ['anna@a.com'], date: d(5) });
+    inbox.add({ subject: 'Re: Plan', from: 'Anna <anna@a.com>', date: d(3) });
+    inbox.add({ subject: 'Hello', from: 'Bob <bob@b.com>', date: d(2) });
+    inbox.add({ subject: 'Sync', from: 'Carl <carl@c.com>', date: d(4), attachments: ['invite.ics'] });
+    inbox.add({ subject: 'Meeting time', from: 'Dan <dan@d.com>', date: d(6) });
+    sent.add({ subject: 'Other topic', to: ['dan@d.com'], date: d(5) });
+    var r = call('read', { action: 'needs_response', args: { account: 'iCloud' } }), by = {};
+    r.items.forEach(function (x) { by[x.from.replace(/ <.*/, '')] = x.situation; });
+    has(by.Anna, 'wrote again after your reply'); eq(by.Bob, 'you have not replied'); eq(by.Carl, 'meeting invitation'); ok(!by.Dan, 'Dan was answered elsewhere');
+    has(r.notes.join(' '), '1 more left out');
+  });
+  test('a folder that appears twice in an account is read as one', function () {
+    var acc = Mail.icloud; acc.mailboxes.push(item({ name: 'Receipts' }));
+    var boxes = acc.mailboxes.items.filter(function (b) { return b.name() === 'Receipts'; });
+    boxes[0].add({ subject: 'first' }); boxes[1].add({ subject: 'second' });
+    eq(call('read', { action: 'list_messages', args: { account: 'iCloud', mailbox: 'Receipts' } }).count, 2);
+  });
+
   // ---- registry sanity
   test('every action has a handler, a tool and arg specs with known types', function () {
     var types = ['string', 'integer', 'boolean', 'id', 'ids', 'list', 'addresses', 'date', 'object', 'objects'];

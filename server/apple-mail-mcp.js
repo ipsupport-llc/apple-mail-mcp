@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.5.0'; // release.yml rewrites this from the tag
+var VERSION = '1.5.1'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -390,11 +390,22 @@ function realBox(m, fallback) { // where a message actually lives
     return { ref: mb, account: acc, path: name, role: roleOfName(roleIndex(), acc, name) };
   }, fallback);
 }
-// The unified inbox as each account's own inbox, so every row knows its account and folder without extra lookups.
+// The folders to read for a box: the unified inbox as each account's own inbox (so every row knows its account and
+// folder), and an account folder together with its namesakes — some Exchange accounts show INBOX, Sent Items … twice.
 function inboxesOf(box) {
-  if (!box.unified) return [box];
-  var list = safe(function () { return mail().inbox.mailboxes(); }, []).map(function (mb) { return { ref: mb, account: accountOfBox(mb), path: safe(function () { return mb.name(); }, 'INBOX'), role: 'inbox' }; });
-  return list.length ? list : [box];
+  if (box.unified) {
+    var list = safe(function () { return mail().inbox.mailboxes(); }, []).map(function (mb) { return { ref: mb, account: accountOfBox(mb), path: safe(function () { return mb.name(); }, 'INBOX'), role: 'inbox' }; });
+    var seen = {}, out = [];
+    list.forEach(function (b) { if (b.account in seen) return; seen[b.account] = 1; out = out.concat(withTwins(b)); }); // one set per account
+    return out.length ? out : [box];
+  }
+  return withTwins(box);
+}
+function withTwins(box) {
+  if (!box.account || box.path.indexOf('/') >= 0) return [box];
+  var twins = safe(function () { return getAccount(box.account).mailboxes.whose({ name: box.path })(); }, []);
+  if (twins.length < 2) return [box];
+  return twins.map(function (mb) { return { ref: mb, account: box.account, path: box.path, role: box.role }; });
 }
 
 // Message lookup. Mail message ids are unique across folders, so a wrong folder is recovered by searching.
@@ -481,6 +492,10 @@ function addRecipients(msg, field, ctor, list) {
 function recips(list) { return (list || []).map(function (r) { var n = r.name(), a = r.address(); return n ? n + ' <' + a + '>' : a; }); }
 function normSubject(s) {
   return lower(String(s || '').replace(/^\s*((re|fw|fwd|aw|wg|sv|tr|rv|ответ|отв|пересл|ha)\s*(\[\d+\])?\s*:\s*)+/i, '').replace(/\s+/g, ' ').trim());
+}
+function isInvitation(r) { // calendar invites: an .ics / text/calendar part, or an invitation-style subject
+  if (/^\s*(invitation|updated invitation|invitation updated|accepted|declined|tentative|приглашение)\s*:/i.test(r.subject || '')) return true;
+  return safe(function () { return r.spec[r.i].mailAttachments().some(function (x) { return /\.ics$/i.test(x.name()) || /calendar/i.test(safe(function () { return x.mimeType(); }, '')); }); }, false);
 }
 function daysAgo(n) { return new Date(Date.now() - n * 864e5); }
 // Messages I sent since cutoff: f(box, id, subject, date, recipients[]) for each.
@@ -689,13 +704,19 @@ var MAIL = {
       .sort(function (x, y) { return y.days_waiting - x.days_waiting; }).slice(0, a.limit);
   },
   // Inbox mail from people, not marked replied, and you have not written to that sender in that conversation since.
+  // Inbox mail from people where they wrote last: not marked replied, and you have not written to that sender since —
+  // in this conversation or any other. Each item says which case it is, so it is not mistaken for "never answered".
   needs_response: function (a) {
-    var cutoff = daysAgo(a.days), me = myAddresses(), lastMine = Object.create(null);
-    eachSent(a.account, cutoff, function (b, id, subject, date, rcpt) {
+    var cutoff = daysAgo(a.days), me = myAddresses(), lastMine = Object.create(null), lastToPerson = Object.create(null);
+    eachSent(a.account, daysAgo(Math.max(a.days, 90)), function (b, id, subject, date, rcpt) { // earlier replies count too
       var subj = normSubject(subject);
-      if (subj) rcpt.forEach(function (who) { var k = subj + '\u0000' + who; if (!lastMine[k] || date > lastMine[k]) lastMine[k] = date; });
+      rcpt.forEach(function (who) {
+        if (!lastToPerson[who] || date > lastToPerson[who]) lastToPerson[who] = date;
+        var k = subj + '\u0000' + who;
+        if (subj && (!lastMine[k] || date > lastMine[k])) lastMine[k] = date;
+      });
     });
-    var latest = Object.create(null), rows = [];
+    var latest = Object.create(null), rows = [], elsewhere = 0;
     inboxesOf(getMailbox(a.account, 'INBOX')).forEach(function (b) { rows = rows.concat(rowsOf(b.ref.messages.whose({ dateReceived: { _greaterThan: cutoff } }), b)); });
     rows.forEach(function (r) {
       var who = addrOf(r.from);
@@ -703,10 +724,22 @@ var MAIL = {
       var k = (normSubject(r.subject) || ('#' + r.id)) + '\u0000' + who;
       if (!latest[k] || r.date > latest[k].date) latest[k] = r;
     });
-    return Object.keys(latest).filter(function (k) { var r = latest[k]; return !r.replied && !(lastMine[k] && lastMine[k] > r.date); })
-      .map(function (k) { var o = rowOut(latest[k]); o.waiting_days = Math.floor((Date.now() - latest[k].date) / 864e5); return o; })
-      .sort(function (x, y) { return y.waiting_days - x.waiting_days; }).slice(0, a.limit);
+    var out = Object.keys(latest).filter(function (k) {
+      var r = latest[k], who = k.split('\u0000')[1];
+      if (r.replied || (lastMine[k] && lastMine[k] > r.date)) return false;
+      if (lastToPerson[who] && lastToPerson[who] > r.date) { elsewhere++; return false; }
+      return true;
+    }).map(function (k) {
+      var r = latest[k], o = rowOut(r), before = lastMine[k];
+      o.waiting_days = Math.floor((Date.now() - r.date) / 864e5);
+      o.situation = isInvitation(r) ? 'meeting invitation' : before ? 'they wrote again after your reply of ' + iso(before).slice(0, 10) : 'you have not replied';
+      return o;
+    }).sort(function (x, y) { return y.waiting_days - x.waiting_days; }).slice(0, a.limit);
+    if (elsewhere) note(elsewhere + ' more left out: you wrote to those senders after their message, in another conversation.');
+    if (out.some(function (o) { return /wrote again/.test(o.situation); })) note('"they wrote again" means you answered earlier in that conversation; their last message may not need a reply — read it before saying so.');
+    return out;
   },
+
   // Same subject AND the same people (sender, or recipients of your own messages) — subject alone merges strangers.
   get_thread: function (a) {
     var found = getMessage(a), m = found.ref, subj = normSubject(m.subject()), me = myAddresses();
@@ -1317,7 +1350,7 @@ var ACTIONS = {
       unread: { type: 'boolean' }, flagged: { type: 'boolean' }, has_attachments: { type: 'boolean' }, limit: LIMIT(20) }, run: MAIL.search_messages },
   awaiting_reply: { tool: 'read', desc: 'Emails you sent that nobody you wrote to has answered. Check this before saying "they never replied".',
     args: { days: DAYS, account: MSG.account, limit: LIMIT(20) }, run: MAIL.awaiting_reply },
-  needs_response: { tool: 'read', desc: 'Inbox emails from people that wait for YOUR answer. Skips no-reply and notification senders.',
+  needs_response: { tool: 'read', desc: 'Inbox emails from people who wrote last and that you have not answered since; each says why (never replied / wrote again / invitation). Skips no-reply senders.',
     args: { days: DAYS, account: MSG.account, limit: LIMIT(20) }, run: MAIL.needs_response },
   get_thread: { tool: 'read', desc: 'The whole conversation of a message, oldest first, with your sent replies.',
     args: ext(MSG, { bodies: { type: 'boolean', 'default': true }, max_chars: { type: 'integer', 'default': 2000, min: 200, max: 20000, desc: 'per message, default 2000' }, limit: LIMIT(30) }), run: MAIL.get_thread },
