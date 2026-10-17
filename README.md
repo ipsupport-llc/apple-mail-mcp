@@ -57,7 +57,7 @@ Ask in plain words — *"what's waiting for my reply?"*, *"forward the printer i
 
 | | |
 | --- | --- |
-| **Send** | New emails with To / Cc / Bcc, from any of your addresses. |
+| **Send** | New emails with To / Cc / Bcc, from any of your addresses, with files attached. |
 | **Reply / reply all** | With the original quoted below. Opens as a draft you check and send. |
 | **Forward** | With attachments and an optional note on top. Opens as a draft too. |
 | **Draft mode** | Replies and forwards open in Mail by default, because Mail itself picks their recipients and quote. New emails can open as drafts as well. |
@@ -139,7 +139,8 @@ Most clients ask before using a tool. We recommend allowing `read` once and appr
 - **No accidental repeats.** The same send, reply, delete or create call twice within 15 minutes is refused — a stuck model can't send an email five times.
 - **Repeating events are deleted only on purpose.** Deleting one removes the whole series, so the extension asks for `whole_series: true`.
 - **Dry runs.** Bulk moves and deletes can be previewed before they happen.
-- **Attachments stay in one place.** They are saved only inside the attachments folder from the settings and are never overwritten — an existing file gets `(1)`, `(2)`… appended.
+- **Attachments stay in one place.** They are saved only inside the attachments folder from the settings and are never overwritten — an existing file gets `(1)`, `(2)`… appended. Files attached to outgoing mail also come only from that folder, so "attach ~/.ssh/id_rsa" is refused; files from other tools (say, a Seafile download) go there first.
+- **Attachments are checked.** If Mail does not take every file, the message is not sent: it opens as a draft instead.
 - **Watch out for instructions hidden in emails.** Anything the assistant reads becomes part of its context, and a malicious email could try to tell it to do something. Keep `write` on manual approval, or turn on read-only mode, if that worries you.
 - **One readable file.** The whole server is [`server/apple-mail-mcp.js`](server/apple-mail-mcp.js), with no dependencies and no network calls.
 
@@ -192,7 +193,7 @@ Two tools, each taking `{ "action": "...", "args": { ... } }`. The full list of 
 
 | Action | Purpose |
 | --- | --- |
-| `send_email` | New email (`draft: true` opens it instead) |
+| `send_email` | New email, `attachments` from the attachments folder (`draft: true` opens it instead) |
 | `reply_message` | Reply / reply all — opens as a draft in Mail by default, `draft: false` sends |
 | `forward_message` | Forward with attachments — draft by default, `draft: false` sends |
 | `set_read` | Mark read / unread, one or many |

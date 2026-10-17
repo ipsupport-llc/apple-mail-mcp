@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.5.3'; // release.yml rewrites this from the tag
+var VERSION = '1.6.0'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -510,6 +510,60 @@ function eachSent(account, cutoff, f) {
     ids.forEach(function (id, i) { f(b, id, subs[i], dates[i], rcpt[i] || []); });
   });
 }
+// ---- attachments for outgoing mail ----
+// JXA cannot add attachments to (or even count those of) an outgoing message; AppleScript can, by the same message id.
+function runAppleScript(src) {
+  var app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  return app.runScript(src, { 'in': 'AppleScript' });
+}
+// Files to attach: names (or paths) inside the attachments folder from the settings — the folder save_attachments and,
+// by default, other tools' downloads (e.g. Seafile's download_file) use.
+function attachmentFiles(list) {
+  if (!list || !list.length) return [];
+  var fm = $.NSFileManager.defaultManager;
+  function where(x) { return stdPath(/^[\/~$]/.test(x) ? x : SAVE_DIR + '/' + x); }
+  function isFile(p) { // a regular file; a symlink does not count (it could point outside the folder)
+    var at = fm.attributesOfItemAtPathError(p, $());
+    return !!at && !at.isNil() && ObjC.unwrap(at.fileType) === 'NSFileTypeRegular';
+  }
+  if (list.length > 1 && !list.some(function (x) { return isFile(where(x)); }) && isFile(where(list.join(', ')))) list = [list.join(', ')]; // one name with a comma
+  var files = list.map(function (x) {
+    var p = where(x);
+    if (p !== SAVE_DIR && p.indexOf(SAVE_DIR + '/') !== 0) fail('Attachments can only come from ' + SAVE_DIR + ' (the attachments folder in the extension settings), not ' + x + '.', 'Save or download the file there first, then give its name.');
+    if (!isFile(p)) fail('No file "' + x + '" in ' + SAVE_DIR + '.', 'Give the name as it is in that folder (e.g. after save_attachments, or a download by another tool).');
+    var size = safe(function () { return Number(ObjC.unwrap(fm.attributesOfItemAtPathError(p, $()).fileSize)); }, null);
+    return { path: p, name: p.split('/').pop(), size: size };
+  });
+  var total = files.reduce(function (n, f) { return n + (f.size || 0); }, 0);
+  if (total > 25 * 1048576) note('Attachments add up to ' + Math.round(total / 1048576) + ' MB; many mail servers refuse messages over 20–25 MB.');
+  return files;
+}
+function fileList(files) { return files.map(function (f) { return { name: f.name, size: f.size }; }); }
+function attachmentCount(msg) { // attachments in an outgoing message's text, or null if Mail would not say
+  return safe(function () { return Number(runAppleScript('tell application "Mail" to count of attachments of content of outgoing message id ' + msg.id())); }, null);
+}
+// Attach after the text is final; if Mail does not take all files, nothing is sent and the draft is shown instead.
+function attachOrStop(msg, files, already, draft) {
+  if (!files.length) return;
+  var lines = ['tell application "Mail"', '  set m to outgoing message id ' + msg.id()];
+  files.forEach(function (f) { lines.push('  tell content of m to make new attachment with properties {file name:(POSIX file ' + q(f.path) + ')} at after last paragraph'); });
+  lines.push('end tell');
+  var err = null;
+  try { runAppleScript(lines.join('\n')); } catch (e) { if (e instanceof Cancelled) throw e; err = errorText(e); }
+  var n = attachmentCount(msg), want = already + files.length;
+  if (err || (n !== null && n < want)) {
+    var why = err ? 'Mail could not attach the files: ' + err + '.' : 'Mail attached ' + Math.max(0, n - already) + ' of ' + files.length + ' file(s).';
+    if (draft) { note(why + ' Tell the user to check the draft.'); return; }
+    showInstead(msg, why + ' Nothing was sent.', 'The draft is open in Mail; the user can attach the files there and press Send.');
+  }
+}
+// Mail cannot delete an outgoing message by script, so one that must not go out is shown to the user, never left hidden.
+function showInstead(msg, message, hint) {
+  safe(function () { msg.visible = true; mail().activate(); });
+  fail(message, hint || 'The message is open in Mail as a draft for the user to check.');
+}
+
 // What a reply would be: Reply-To (or the sender) as To; with reply_all also everyone else, minus your own addresses.
 function replyPlan(m, a) {
   var me = myAddresses(), subject = m.subject() || '', from = m.sender(), replyTo = trim(safe(function () { return m.replyTo(); }, '') || '');
@@ -801,7 +855,8 @@ var MAIL = {
       note('Sending from ' + accAddr + ' (account ' + acc + ').');
       a.from = accAddr;
     }
-    var plan = { from: a.from || "the account's default address", to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: a.subject, body: a.body };
+    var files = attachmentFiles(a.attachments);
+    var plan = { from: a.from || "the account's default address", to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: a.subject, body: a.body, attachments: fileList(files) };
     if (a.dry_run) return { dry_run: true, would_send: plan };
     var msg = M.OutgoingMessage({ subject: a.subject, content: a.body, visible: a.draft });
     M.outgoingMessages.push(msg);
@@ -809,7 +864,9 @@ var MAIL = {
     addRecipients(msg, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(msg, 'bccRecipients', M.BccRecipient, a.bcc);
     if (a.from) msg.sender = a.from;
+    attachOrStop(msg, files, 0, a.draft); // after the text: setting the text later would drop them
     var info = outgoingInfo(msg, plan.from);
+    info.attachments = fileList(files);
     if (a.draft) { M.activate(); info.status = 'Draft opened in Mail. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(msg.send(), 'email');
@@ -818,28 +875,28 @@ var MAIL = {
   // Recipients and quote are worked out here (Reply-To, reply-all minus your own addresses) so dry_run shows exactly
   // what goes out, and a real send stops if Mail would address it differently.
   reply_message: function (a) {
-    var M = mail(), m = getMessage(a).ref, plan = replyPlan(m, a);
+    var M = mail(), m = getMessage(a).ref, plan = replyPlan(m, a), files = attachmentFiles(a.attachments);
+    plan.attachments = fileList(files);
     if (a.dry_run) return { dry_run: true, would_send: plan };
     var r = M.reply(m, { openingWindow: a.draft, replyToAll: a.reply_all });
     r.content = plan.body;
     var info = outgoingInfo(r), want = addrSet(plan.to.concat(plan.cc)), got = addrSet(info.to.concat(info.cc));
     if (want !== got) {
-      if (!a.draft) {
-        safe(function () { r.close({ saving: 'no' }); });
-        fail('Mail would address this reply to ' + (got || 'nobody') + ', not ' + want + ' as previewed. Nothing was sent.', 'Use draft:true so the user can check the recipients in Mail.');
-      }
+      if (!a.draft) showInstead(r, 'Mail would address this reply to ' + (got || 'nobody') + ', not ' + want + ' as previewed. Nothing was sent.');
       note('Mail addressed the draft to ' + (got || 'nobody') + ' (expected ' + want + '); tell the user to check the recipients.');
     }
+    attachOrStop(r, files, 0, a.draft);
+    info.attachments = fileList(files);
     if (a.draft) { M.activate(); info.status = 'Reply opened in Mail as a draft. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(r.send(), 'reply');
     return sentInfo(info);
   },
   forward_message: function (a) {
-    var M = mail(), m = getMessage(a).ref, files = attachmentsOf(m), original = '---------- Forwarded message ----------\nFrom: ' + m.sender() +
+    var M = mail(), m = getMessage(a).ref, carried = attachmentsOf(m), files = attachmentFiles(a.attachments), original = '---------- Forwarded message ----------\nFrom: ' + m.sender() +
       '\nDate: ' + (iso(m.dateReceived()) || '') + '\nSubject: ' + m.subject() + '\n\n' + (safe(function () { return m.content(); }, '') || '');
     var plan = { to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: /^(fwd?|fw):/i.test(m.subject()) ? m.subject() : 'Fwd: ' + m.subject(),
-      body: (a.body ? a.body + '\n\n' : '') + original, attachments: files.map(function (x) { return x.name; }) };
+      body: (a.body ? a.body + '\n\n' : '') + original, attachments: carried.map(function (x) { return x.name; }).concat(files.map(function (f) { return f.name; })) };
     if (a.dry_run) {
       plan.body = page(plan.body, 0, 20000).text;
       note("Mail writes the forwarded part itself (its own header and formatting), so that part of the body is close to, not exactly, what is sent. Recipients, subject, note and attachments are exact.");
@@ -850,13 +907,14 @@ var MAIL = {
     addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(f, 'bccRecipients', M.BccRecipient, a.bcc);
     if (a.body) f.content = a.body + '\n\n' + (safe(function () { return f.content(); }, '') || original);
-    var kept = safe(function () { return f.mailAttachments().length; }, files.length);
-    var info = outgoingInfo(f);
-    info.attachments = kept;
-    if (kept < files.length) {
-      if (!a.draft) { safe(function () { f.close({ saving: 'no' }); }); fail('Adding the note dropped the attachments, so nothing was sent.', 'Forward without "body", or use draft:true and let the user add the note in Mail.'); }
-      note('Mail dropped ' + (files.length - kept) + ' attachment(s) when the note was added; tell the user to check the draft.');
+    var kept = attachmentCount(f);
+    if (kept !== null && kept < carried.length) {
+      if (!a.draft) showInstead(f, 'Adding the note dropped the forwarded attachments, so nothing was sent.', 'Forward without "body", or let the user add the note in the draft that is now open in Mail.');
+      note('Mail dropped ' + (carried.length - kept) + ' attachment(s) when the note was added; tell the user to check the draft.');
     }
+    attachOrStop(f, files, kept === null ? carried.length : kept, a.draft);
+    var info = outgoingInfo(f);
+    info.attachments = carried.map(function (x) { return { name: x.name, size: x.size, forwarded: true }; }).concat(fileList(files));
     if (a.draft) { M.activate(); info.status = 'Forward opened in Mail as a draft. Nothing was sent: the user checks it and presses Send.'; return info; }
     checkCancelled();
     ensureSent(f.send(), 'forward');
@@ -963,10 +1021,8 @@ var MAIL = {
     lines.push('  end tell', '  if (count of rule conditions of r) is not ' + a.conditions.length + ' then error "Mail did not keep the rule conditions"');
     if (a.enabled) lines.push('  set enabled of r to true');
     lines.push('end tell');
-    var app = Application.currentApplication();
-    app.includeStandardAdditions = true;
     checkCancelled();
-    try { app.runScript(lines.join('\n'), { 'in': 'AppleScript' }); } catch (e) {
+    try { runAppleScript(lines.join('\n')); } catch (e) {
       try { var r = mail().rules.byName(a.name); r.name(); mail()['delete'](r); } catch (e2) {} // never leave a half-built rule behind
       fail('Mail could not create the rule: ' + errorText(e) + '. Nothing was left behind.');
     }
@@ -1335,6 +1391,7 @@ var MANY = { ids: { type: 'ids', desc: 'message ids, e.g. [123, 456]' }, id: { t
 function LIMIT(d, max) { return { type: 'integer', 'default': d, min: 1, max: max || 100, desc: 'default ' + d }; }
 var PAGE = { offset: { type: 'integer', 'default': 0, min: 0, desc: 'where to start in long text (next_offset)' }, max_chars: { type: 'integer', 'default': 12000, min: 200, max: 60000, desc: 'default 12000' } };
 var DAYS = { type: 'integer', 'default': 14, min: 1, max: 365, desc: 'look back, default 14' };
+var ATTACH = { type: 'list', desc: 'file names in the attachments folder (e.g. from save_attachments or another tool\'s download)', aliases: ['files', 'attach', 'attachment', 'file'] };
 
 var ACTIONS = {
   // ---- Mail: read
@@ -1358,14 +1415,14 @@ var ACTIONS = {
   read_message: { tool: 'read', desc: 'One message: headers, attachments and text (long text is paged with offset).', args: ext(MSG, PAGE), run: MAIL.read_message },
   list_rules: { tool: 'read', desc: 'Mail rules with conditions and actions.', args: {}, run: MAIL.list_rules },
   // ---- Mail: write
-  send_email: { tool: 'write', guard: true, desc: 'Send a new email. draft:true opens it in Mail instead; dry_run:true only shows what would be sent.',
+  send_email: { tool: 'write', guard: true, desc: 'Send a new email, optionally with files from the attachments folder. draft:true opens it in Mail instead; dry_run:true only shows what would be sent.',
     args: { to: { type: 'addresses', required: true, desc: 'addresses, comma separated' }, cc: { type: 'addresses' }, bcc: { type: 'addresses' },
       subject: { type: 'string', required: true }, body: { type: 'string', required: true, raw: true, desc: 'plain text' },
-      from: { type: 'string', desc: 'one of your addresses; default: Mail decides' }, draft: { type: 'boolean', 'default': false }, dry_run: { type: 'boolean', 'default': false } }, run: MAIL.send_email },
+      from: { type: 'string', desc: 'one of your addresses; default: Mail decides' }, attachments: ATTACH, draft: { type: 'boolean', 'default': false }, dry_run: { type: 'boolean', 'default': false } }, run: MAIL.send_email },
   reply_message: { tool: 'write', guard: true, desc: 'Reply (with quote). Opens as a draft in Mail; draft:false sends; dry_run:true shows recipients, subject and body first.',
-    args: ext(MSG, { body: { type: 'string', required: true, raw: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.reply_message },
+    args: ext(MSG, { body: { type: 'string', required: true, raw: true, desc: 'your reply text' }, reply_all: { type: 'boolean', 'default': false }, attachments: ATTACH, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.reply_message },
   forward_message: { tool: 'write', guard: true, desc: 'Forward with attachments and an optional note. Opens as a draft; draft:false sends; dry_run:true shows it first.',
-    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', raw: true, desc: 'note above the forwarded text' }, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.forward_message },
+    args: ext(MSG, { to: { type: 'addresses', required: true }, cc: { type: 'addresses' }, bcc: { type: 'addresses' }, body: { type: 'string', raw: true, desc: 'note above the forwarded text' }, attachments: ATTACH, draft: { type: 'boolean', 'default': true, desc: 'default true' }, dry_run: { type: 'boolean', 'default': false } }), run: MAIL.forward_message },
   set_read: { tool: 'write', desc: 'Mark messages read (read:true) or unread (read:false).', args: ext(MANY, { read: { type: 'boolean', required: true } }), run: MAIL.set_read },
   set_flag: { tool: 'write', desc: 'Flag messages (optional color) or unflag them (flagged:false).',
     args: ext(MANY, { flagged: { type: 'boolean', 'default': true }, color: { type: 'string', values: ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'gray'], valueAliases: { grey: 'gray', violet: 'purple' } } }), run: MAIL.set_flag },
@@ -1601,6 +1658,7 @@ var PUBLIC_TOOLS = [
 if (READ_ONLY) PUBLIC_TOOLS = PUBLIC_TOOLS.filter(function (t) { return t.name === 'read'; });
 var INSTRUCTIONS = 'Apple Mail, Calendar and Notes on this Mac. The read tool looks, the write tool changes. ' +
   'Copy id, account and mailbox together from the same result row. Replies and forwards open as drafts unless draft:false: tell the user to press Send in Mail. ' +
+  'To attach a file from another tool (e.g. a cloud drive), download it into the attachments folder first, then pass its name in attachments. ' +
   'Never repeat a call that succeeded. If a result has "notes", follow them. Ask the user before sending or deleting anything they did not clearly ask for.';
 
 // ======================================================================
