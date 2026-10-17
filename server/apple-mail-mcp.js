@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '1.6.0'; // release.yml rewrites this from the tag
+var VERSION = '1.6.1'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -510,6 +510,7 @@ function eachSent(account, cutoff, f) {
     ids.forEach(function (id, i) { f(b, id, subs[i], dates[i], rcpt[i] || []); });
   });
 }
+var PLACEHOLDER = /@(example\.(com|org|net)|test\.com|domain\.com|email\.com)$|^(your[_.-]?email|user|me|name)@/i; // senders models invent
 // ---- attachments for outgoing mail ----
 // JXA cannot add attachments to (or even count those of) an outgoing message; AppleScript can, by the same message id.
 function runAppleScript(src) {
@@ -534,7 +535,7 @@ function attachmentFiles(list) {
   var files = list.map(function (x) {
     var p = where(x);
     if (p !== SAVE_DIR && p.indexOf(SAVE_DIR + '/') !== 0) fail('Attachments can only come from ' + SAVE_DIR + ' (the attachments folder in the extension settings), not ' + x + '.', 'Save or download the file there first, then give its name.');
-    if (!isFile(p)) fail('No file "' + x + '" in ' + SAVE_DIR + '.', 'Give the name as it is in that folder (e.g. after save_attachments, or a download by another tool).');
+    if (!isFile(p)) fail('No file "' + x + '" in ' + SAVE_DIR + '.', 'Attachments must be in that folder first: download the file there (e.g. with a cloud-drive tool\'s download), then pass its name.');
     var size = safe(function () { return Number(ObjC.unwrap(fm.attributesOfItemAtPathError(p, $()).fileSize)); }, null);
     return { path: p, name: p.split('/').pop(), size: size };
   });
@@ -851,14 +852,16 @@ var MAIL = {
   },
 
   send_email: function (a) {
-    var M = mail();
+    var M = mail(), problems = [], hints = [];
+    if (a.from && PLACEHOLDER.test(addrOf(a.from)) && !myAddresses()[addrOf(a.from)]) { note('Ignored the placeholder sender "' + a.from + '"; Mail uses the account\'s address.'); a.from = null; }
     if (a.from && !myAddresses()[addrOf(a.from)]) {
       var acc = pickName(a.from, accountNames()), accAddr = acc && safe(function () { return M.accounts.byName(acc).emailAddresses()[0]; }, null);
-      if (!accAddr) fail('"' + a.from + '" is not one of your sending addresses.', 'Use one of: ' + Object.keys(myAddresses()).join(', ') + ' — or leave "from" out.');
-      note('Sending from ' + accAddr + ' (account ' + acc + ').');
-      a.from = accAddr;
+      if (accAddr) { note('Sending from ' + accAddr + ' (account ' + acc + ').'); a.from = accAddr; }
+      else { problems.push('"' + a.from + '" is not one of your sending addresses.'); hints.push('For "from" use one of: ' + Object.keys(myAddresses()).join(', ') + ' — or leave it out.'); }
     }
-    var files = attachmentFiles(a.attachments);
+    var files = [];
+    try { files = attachmentFiles(a.attachments); } catch (e) { if (!(e instanceof UserError)) throw e; problems.push(e.message); hints.push(e.hint); }
+    if (problems.length) fail(problems.join(' '), hints.join(' ')); // every problem at once, so a small model fixes them in one go
     var plan = { from: a.from || "the account's default address", to: a.to, cc: a.cc || [], bcc: a.bcc || [], subject: a.subject, body: a.body, attachments: fileList(files) };
     if (a.dry_run) return { dry_run: true, would_send: plan };
     var msg = M.OutgoingMessage({ subject: a.subject, content: a.body, visible: a.draft });
