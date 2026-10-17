@@ -215,7 +215,7 @@ function coerce(v, spec, key, strict) {
       return items.map(function (x, i) { return coerce(x, { type: 'id' }, key + '[' + i + ']', strict); });
     }
     case 'list': {
-      var names = (Array.isArray(v) ? v.map(String) : toList(v)).map(trim).filter(Boolean);
+      var names = (Array.isArray(v) ? v.map(String) : spec.keepString ? [String(v)] : toList(v)).map(trim).filter(Boolean); // keepString: file names can contain commas
       if (!names.length) bad('a non-empty list (leave it out instead)'); // an empty selector must not mean "all"
       return names;
     }
@@ -527,7 +527,10 @@ function attachmentFiles(list) {
     var at = fm.attributesOfItemAtPathError(p, $());
     return !!at && !at.isNil() && ObjC.unwrap(at.fileType) === 'NSFileTypeRegular';
   }
-  if (list.length > 1 && !list.some(function (x) { return isFile(where(x)); }) && isFile(where(list.join(', ')))) list = [list.join(', ')]; // one name with a comma
+  if (list.length === 1 && !isFile(where(list[0])) && /,/.test(list[0])) { // "a.pdf, b.pdf" given as one string: two files, if both exist
+    var parts = list[0].split(',').map(trim).filter(Boolean);
+    if (parts.length > 1 && parts.every(function (x) { return isFile(where(x)); })) { note('Read "' + list[0] + '" as ' + parts.length + ' files.'); list = parts; }
+  }
   var files = list.map(function (x) {
     var p = where(x);
     if (p !== SAVE_DIR && p.indexOf(SAVE_DIR + '/') !== 0) fail('Attachments can only come from ' + SAVE_DIR + ' (the attachments folder in the extension settings), not ' + x + '.', 'Save or download the file there first, then give its name.');
@@ -552,8 +555,8 @@ function attachOrStop(msg, files, already, draft) {
   var err = null;
   try { runAppleScript(lines.join('\n')); } catch (e) { if (e instanceof Cancelled) throw e; err = errorText(e); }
   var n = attachmentCount(msg), want = already + files.length;
-  if (err || (n !== null && n < want)) {
-    var why = err ? 'Mail could not attach the files: ' + err + '.' : 'Mail attached ' + Math.max(0, n - already) + ' of ' + files.length + ' file(s).';
+  if (err || n === null || n < want) { // a count Mail would not give is a failure too: never send unverified
+    var why = err ? 'Mail could not attach the files: ' + err + '.' : n === null ? 'Mail would not say whether the files are attached.' : 'Mail attached ' + Math.max(0, n - already) + ' of ' + files.length + ' file(s).';
     if (draft) { note(why + ' Tell the user to check the draft.'); return; }
     showInstead(msg, why + ' Nothing was sent.', 'The draft is open in Mail; the user can attach the files there and press Send.');
   }
@@ -907,10 +910,10 @@ var MAIL = {
     addRecipients(f, 'ccRecipients', M.CcRecipient, a.cc);
     addRecipients(f, 'bccRecipients', M.BccRecipient, a.bcc);
     if (a.body) f.content = a.body + '\n\n' + (safe(function () { return f.content(); }, '') || original);
-    var kept = attachmentCount(f);
-    if (kept !== null && kept < carried.length) {
-      if (!a.draft) showInstead(f, 'Adding the note dropped the forwarded attachments, so nothing was sent.', 'Forward without "body", or let the user add the note in the draft that is now open in Mail.');
-      note('Mail dropped ' + (carried.length - kept) + ' attachment(s) when the note was added; tell the user to check the draft.');
+    var kept = carried.length ? attachmentCount(f) : 0;
+    if (kept === null || kept < carried.length) {
+      if (!a.draft) showInstead(f, kept === null ? 'Mail would not say whether the forwarded attachments are still there, so nothing was sent.' : 'Adding the note dropped the forwarded attachments, so nothing was sent.', 'Forward without "body", or let the user add the note in the draft that is now open in Mail.');
+      note('The forwarded attachments could not be confirmed; tell the user to check the draft.');
     }
     attachOrStop(f, files, kept === null ? carried.length : kept, a.draft);
     var info = outgoingInfo(f);
@@ -1391,7 +1394,7 @@ var MANY = { ids: { type: 'ids', desc: 'message ids, e.g. [123, 456]' }, id: { t
 function LIMIT(d, max) { return { type: 'integer', 'default': d, min: 1, max: max || 100, desc: 'default ' + d }; }
 var PAGE = { offset: { type: 'integer', 'default': 0, min: 0, desc: 'where to start in long text (next_offset)' }, max_chars: { type: 'integer', 'default': 12000, min: 200, max: 60000, desc: 'default 12000' } };
 var DAYS = { type: 'integer', 'default': 14, min: 1, max: 365, desc: 'look back, default 14' };
-var ATTACH = { type: 'list', desc: 'file names in the attachments folder (e.g. from save_attachments or another tool\'s download)', aliases: ['files', 'attach', 'attachment', 'file'] };
+var ATTACH = { type: 'list', keepString: true, desc: 'file names in the attachments folder (e.g. from save_attachments or another tool\'s download)', aliases: ['files', 'attach', 'attachment', 'file'] };
 
 var ACTIONS = {
   // ---- Mail: read

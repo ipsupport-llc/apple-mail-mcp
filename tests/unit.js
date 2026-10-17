@@ -717,6 +717,12 @@ function run(argv) {
       eq(d.would_send.attachments.map(function (x) { return x.name; }), ['report, final.pdf']);
       has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['/etc/hosts'] } }), 'can only come from');
       has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['missing.pdf'] } }), 'No file "missing.pdf"');
+      $('a').writeToFileAtomicallyEncodingError(dir + '/a.pdf', true, $.NSUTF8StringEncoding, $()); $('b').writeToFileAtomicallyEncodingError(dir + '/b.pdf', true, $.NSUTF8StringEncoding, $());
+      eq(call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: 'a.pdf, b.pdf', dry_run: true } }).would_send.attachments.length, 2);
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['report', 'final.pdf'] } }), 'No file "report"');
+      var orig = Mail.runAppleScript; Mail.runAppleScript = function (src) { if (/count of attachments/.test(src)) throw new Error('timeout'); return orig(src); };
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's2', body: 'b', attachments: ['notes.txt'] } }), 'would not say');
+      eq(Mail.sent.length, 0); Mail.runAppleScript = orig;
       var r = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', files: ['notes.txt', 'report, final.pdf'] } });
       eq(r.status, 'Sent.'); eq(r.attachments.length, 2); eq(Mail.sent[0]._files().length, 2);
     } finally { SAVE_DIR = old; $.NSFileManager.defaultManager.removeItemAtPathError(dir, $()); }
