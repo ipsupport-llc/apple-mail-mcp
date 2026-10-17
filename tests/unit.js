@@ -115,15 +115,18 @@ function makeMail() {
   M['delete'] = function (x) { M.deleted.push(x); };
   M.sent = [];
   M.sendResult = true;
+  M.byId = {}; M.nextOutId = 1;
   function outgoing(props) {
     var o = item({ subject: props.subject || '', content: props.content || '', sender: '', visible: !!props.visible });
+    var oid = M.nextOutId++; o.id = function () { return oid; }; M.byId[oid] = o;
     ['toRecipients', 'ccRecipients', 'bccRecipients'].forEach(function (f) {
       var list = []; var fn = function () { return list; }; fn.push = function (r) { list.push(r); }; fn.address = function () { return list.map(function (r) { return r.address(); }); };
       Object.defineProperty(o, f, { value: fn });
     });
     o.send = function () { M.sent.push(o); return M.sendResult; };
-    var files = props.attachments || [];
-    o.mailAttachments = function () { return files; };
+    var files = (props.attachments || []).slice();
+    o.mailAttachments = function () { throw new Error("Can't get object."); }; // like Mail: outgoing messages have no mail attachments
+    o._files = function () { return files; }; o._attach = function (p) { if (!M.unreadable || M.unreadable.indexOf(p) < 0) files.push(p); };
     var content = props.content || '';
     Object.defineProperty(o, 'content', { get: function () { return function () { return content; }; },
       set: function (v) { content = v; if (M.editDropsAttachments) files = []; } });
@@ -137,6 +140,14 @@ function makeMail() {
   M.forward = function (m, opts) { var o = outgoing({ subject: 'Fwd: ' + m.subject(), content: '', attachments: m.mailAttachments() }); o.opts = opts; return o; };
   M.editDropsAttachments = false;
   M.activate = function () {};
+  M.runAppleScript = function (src) { // the AppleScript the server sends for outgoing attachments
+    var id = Number((/outgoing message id (\d+)/.exec(src) || [])[1]), o = M.byId[id];
+    if (!o) throw new Error("Can't get outgoing message id " + id + '.');
+    if (/make new attachment/.test(src)) { (src.match(/POSIX file "((?:[^"\\]|\\.)*)"/g) || []).forEach(function (m) { o._attach(m.replace(/^POSIX file "/, '').replace(/"$/, '').replace(/\\(.)/g, '$1')); }); return ''; }
+    if (/count of attachments of content/.test(src)) return o._files().length;
+    if (/make new rule/.test(src)) return '';
+    throw new Error('fake AppleScript: ' + src.slice(0, 60));
+  };
   M.Mailbox = function (p) { return item(p); };
   M.rules = coll([], { onPush: function (x, items) { items.push(item(x._props)); } });
   M.save = function (x, opts) { M.saved = (M.saved || []).concat(String(opts['in'])); };
@@ -215,7 +226,7 @@ function run(argv) {
     .replace("name: 'AppleMailMCPStdin'", "name: 'AppleMailMCPStdinTest" + Date.now() + "'");
   (0, eval)(src);
   var passed = 0, failed = [];
-  function reset() { Mail = makeMail(); Cal = makeCalendar(); NotesApp = makeNotes(); DONE = []; LAST_READ = { key: null, at: 0 }; EVENT_CACHE = {}; }
+  function reset() { Mail = makeMail(); runAppleScript = function (src) { return Mail.runAppleScript(src); }; Cal = makeCalendar(); NotesApp = makeNotes(); DONE = []; LAST_READ = { key: null, at: 0 }; EVENT_CACHE = {}; }
   function call(tool, input) { return JSON.parse(formatResult(callPublic(tool, input))); }
   function callErr(tool, input) {
     try { callPublic(tool, input); } catch (e) { return formatError(e); }
@@ -351,10 +362,10 @@ function run(argv) {
   });
   test('forward keeps attachments without a note; one that loses them on edit is not sent', function () {
     var plain = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf'] });
-    eq(call('write', { action: 'forward_message', args: { id: plain.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }).attachments, 1);
+    eq(call('write', { action: 'forward_message', args: { id: plain.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }).attachments.length, 1);
     Mail.editDropsAttachments = true;
     var m = Mail.box('iCloud', 'INBOX').add({ attachments: ['a.pdf'] });
-    has(callErr('write', { action: 'forward_message', args: { id: m.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }), 'dropped the attachments');
+    has(callErr('write', { action: 'forward_message', args: { id: m.id(), account: 'iCloud', to: 'b@example.com', body: 'fyi', draft: false } }), 'dropped the forwarded attachments');
     eq(Mail.sent.length, 1, 'only the first forward went out');
   });
   test('save_attachments stays inside the attachments folder', function () {
@@ -693,6 +704,50 @@ function run(argv) {
     var boxes = acc.mailboxes.items.filter(function (b) { return b.name() === 'Receipts'; });
     boxes[0].add({ subject: 'first' }); boxes[1].add({ subject: 'second' });
     eq(call('read', { action: 'list_messages', args: { account: 'iCloud', mailbox: 'Receipts' } }).count, 2);
+  });
+
+  test('attachments: from the attachments folder only, shown in dry_run and in the result', function () {
+    var dir = ObjC.unwrap($.NSTemporaryDirectory()).replace(/\/$/, '') + '/amcp-att-' + Date.now();
+    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
+    var old = SAVE_DIR; SAVE_DIR = stdPath(dir);
+    try {
+      $('report').writeToFileAtomicallyEncodingError(dir + '/report, final.pdf', true, $.NSUTF8StringEncoding, $());
+      $('x').writeToFileAtomicallyEncodingError(dir + '/notes.txt', true, $.NSUTF8StringEncoding, $());
+      var d = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: 'report, final.pdf', dry_run: true } });
+      eq(d.would_send.attachments.map(function (x) { return x.name; }), ['report, final.pdf']);
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['/etc/hosts'] } }), 'can only come from');
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['missing.pdf'] } }), 'No file "missing.pdf"');
+      $('a').writeToFileAtomicallyEncodingError(dir + '/a.pdf', true, $.NSUTF8StringEncoding, $()); $('b').writeToFileAtomicallyEncodingError(dir + '/b.pdf', true, $.NSUTF8StringEncoding, $());
+      eq(call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: 'a.pdf, b.pdf', dry_run: true } }).would_send.attachments.length, 2);
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['report', 'final.pdf'] } }), 'No file "report"');
+      var orig = Mail.runAppleScript; Mail.runAppleScript = function (src) { if (/count of attachments/.test(src)) throw new Error('timeout'); return orig(src); };
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's2', body: 'b', attachments: ['notes.txt'] } }), 'would not say');
+      eq(Mail.sent.length, 0); Mail.runAppleScript = orig;
+      var r = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', files: ['notes.txt', 'report, final.pdf'] } });
+      eq(r.status, 'Sent.'); eq(r.attachments.length, 2); eq(Mail.sent[0]._files().length, 2);
+    } finally { SAVE_DIR = old; $.NSFileManager.defaultManager.removeItemAtPathError(dir, $()); }
+  });
+  test('a file Mail does not attach stops the send and shows the draft', function () {
+    var dir = ObjC.unwrap($.NSTemporaryDirectory()).replace(/\/$/, '') + '/amcp-att2-' + Date.now();
+    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
+    var old = SAVE_DIR; SAVE_DIR = stdPath(dir);
+    try {
+      $('x').writeToFileAtomicallyEncodingError(dir + '/locked.pdf', true, $.NSUTF8StringEncoding, $());
+      Mail.unreadable = [SAVE_DIR + '/locked.pdf'];
+      has(callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', attachments: ['locked.pdf'] } }), 'attached 0 of 1');
+      eq(Mail.sent.length, 0); ok(Mail.byId[1].visible() === true, 'the draft is shown, not left hidden');
+    } finally { SAVE_DIR = old; $.NSFileManager.defaultManager.removeItemAtPathError(dir, $()); }
+  });
+  test('reply with an attachment', function () {
+    var dir = ObjC.unwrap($.NSTemporaryDirectory()).replace(/\/$/, '') + '/amcp-att3-' + Date.now();
+    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
+    var old = SAVE_DIR; SAVE_DIR = stdPath(dir);
+    try {
+      $('x').writeToFileAtomicallyEncodingError(dir + '/a.pdf', true, $.NSUTF8StringEncoding, $());
+      var m = Mail.box('iCloud', 'INBOX').add({ from: 'Anna <anna@example.com>' });
+      var r = call('write', { action: 'reply_message', args: { id: m.id(), body: 'here', attachments: ['a.pdf'], draft: false } });
+      eq(r.status, 'Sent.'); eq(Mail.sent[0]._files().length, 1);
+    } finally { SAVE_DIR = old; $.NSFileManager.defaultManager.removeItemAtPathError(dir, $()); }
   });
 
   // ---- registry sanity
