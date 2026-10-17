@@ -727,6 +727,12 @@ function run(argv) {
       eq(r.status, 'Sent.'); eq(r.attachments.length, 2); eq(Mail.sent[0]._files().length, 2);
     } finally { SAVE_DIR = old; $.NSFileManager.defaultManager.removeItemAtPathError(dir, $()); }
   });
+  test('send_email: placeholder sender ignored; a wrong sender and a missing file reported together', function () {
+    var r = call('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', from: 'your_email@example.com', dry_run: true } });
+    has(r.notes.join(' '), 'Ignored the placeholder sender');
+    var e = callErr('write', { action: 'send_email', args: { to: 'b@example.com', subject: 's', body: 'b', from: 'ceo@evil.com', attachments: ['nope.pdf'] } });
+    has(e, 'not one of your sending addresses'); has(e, 'No file "nope.pdf"'); has(e, 'download the file there');
+  });
   test('a file Mail does not attach stops the send and shows the draft', function () {
     var dir = ObjC.unwrap($.NSTemporaryDirectory()).replace(/\/$/, '') + '/amcp-att2-' + Date.now();
     $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
